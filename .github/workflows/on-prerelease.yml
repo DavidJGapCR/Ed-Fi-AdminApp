@@ -14,7 +14,7 @@ env:
   # Artifacts publishing action in the future.
   # ARTIFACTS_API_KEY: ${{ secrets.AZURE_ARTIFACTS_PERSONAL_ACCESS_TOKEN }}
   # NPM_REGISTRY: //pkgs.dev.azure.com/ed-fi-alliance/Ed-Fi-Alliance-OSS/_packaging/EdFi/npm/registry/
-  PACKAGE_NAME: "AdminApp"
+  # PACKAGE_NAME: "AdminApp"
   API_IMAGE_NAME: ${{ vars.API_IMAGE_NAME }}
   FRONTEND_IMAGE_NAME: ${{ vars.FRONTEND_IMAGE_NAME }}
   DOCKER_USERNAME: ${{ vars.DOCKER_USERNAME }}
