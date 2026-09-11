@@ -1,11 +1,10 @@
 import { Link, Text } from '@chakra-ui/react';
 import { GetSbEnvironmentDto } from '@edanalytics/models';
 import { UseQueryResult, useQuery } from '@tanstack/react-query';
-import { RouteObject, useParams, Link as RouterLink } from 'react-router-dom';
+import { RouteObject, useParams, Link as RouterLink } from 'react-router';
 import { SbEnvironmentGlobalPage } from '../Pages/SbEnvironmentGlobal/SbEnvironmentGlobalPage';
 import { SbEnvironmentsGlobalPage } from '../Pages/SbEnvironmentGlobal/SbEnvironmentsGlobalPage';
 import { sbEnvironmentQueries } from '../api';
-import { getRelationDisplayName } from '../helpers';
 import { getEntityFromQuery } from '../helpers/getEntityFromQuery';
 import { CreateSbEnvironmentGlobalPage } from '../Pages/SbEnvironmentGlobal/CreateSbEnvironmentGlobalPage';
 import { EditSbEnvironmentGlobalPage } from '../Pages/SbEnvironmentGlobal/EditSbEnvironmentGlobalPage';
@@ -43,13 +42,14 @@ export const sbEnvironmentsGlobalRoute: RouteObject = {
 
 export const SbEnvironmentGlobalLink = (props: {
   id: number | undefined;
-  query: Pick<UseQueryResult<Record<string | number, GetSbEnvironmentDto>, unknown>, 'data'>;
+  query?: Pick<UseQueryResult<Record<string | number, GetSbEnvironmentDto>, unknown>, 'data'>;
+  sbEnvironment?: GetSbEnvironmentDto;
 }) => {
-  const sbEnvironment = getEntityFromQuery(props.id, props.query);
+  const sbEnvironment = props.sbEnvironment ?? (props.query ? getEntityFromQuery(props.id, props.query) : undefined);
   return sbEnvironment ? (
     <Link as="span">
       <RouterLink title="Go to environment" to={`/sb-environments/${sbEnvironment.id}`}>
-        {getRelationDisplayName(props.id, props.query)}
+        {sbEnvironment.displayName}
       </RouterLink>
     </Link>
   ) : typeof props.id === 'number' ? (

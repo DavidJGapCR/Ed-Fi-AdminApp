@@ -1,17 +1,36 @@
 import {
   CopyClaimsetDtoV2,
+  EducationOrganizationDto,
+  GetActionDtoV2,
+  GetApiClientDtoV2,
+  GetApplicationDtoV2,
+  GetAuthStrategyDtoV2,
+  GetClaimsetMultipleDtoV2,
+  GetClaimsetSingleDtoV2,
+  GetOdsInstanceContextDtoV2,
+  GetOdsInstanceDerivativeDtoV2,
+  GetOdsInstanceDetailDtoV2,
+  GetOdsInstanceSummaryDtoV2,
+  GetProfileDtoV2,
+  GetResourceClaimDetailDtoV2,
+  GetVendorDtoV2,
   ISbEnvironmentConfigPrivateV2,
   Id,
   ImportClaimsetSingleDtoV2,
+  OdsInstanceDto,
+  PostApiClientDtoV2,
   PostActionAuthStrategiesDtoV2,
   PostApplicationDtoV2,
   PostClaimsetDtoV2,
   PostClaimsetResourceClaimActionsDtoV2,
+  PostInstanceDtoV2,
   PostOdsInstanceContextDtoV2,
   PostOdsInstanceDerivativeDtoV2,
+  PostApplicationResponseDtoV2,
   PostOdsInstanceDtoV2,
   PostProfileDtoV2,
   PostVendorDtoV2,
+  PutApiClientDtoV2,
   PutApplicationDtoV2,
   PutClaimsetDtoV2,
   PutClaimsetResourceClaimActionsDtoV2,
@@ -20,8 +39,10 @@ import {
   PutOdsInstanceDtoV2,
   PutProfileDtoV2,
   PutVendorDtoV2,
+  TenantDto,
   toGetActionDtoV2,
   toGetApplicationDtoV2,
+  toGetApiClientDtoV2,
   toGetAuthStrategyDtoV2,
   toGetClaimsetMultipleDtoV2,
   toGetClaimsetSingleDtoV2,
@@ -33,15 +54,66 @@ import {
   toGetResourceClaimDetailDtoV2,
   toGetVendorDtoV2,
   toPostApplicationResponseDtoV2,
+  PostApiClientResponseDtoV2,
+  toPostApiClientResponseDtoV2,
 } from '@edanalytics/models';
-import { EdfiTenant } from '@edanalytics/models-server';
+import { EdfiTenant, SbEnvironment } from '@edanalytics/models-server';
 import { Inject, Injectable, Logger } from '@nestjs/common';
 import axios, { AxiosError, isAxiosError } from 'axios';
 import crypto from 'crypto';
 import NodeCache from 'node-cache';
 import { CustomHttpException } from '../../../../utils';
+import {
+  pollJobStatus,
+  triggerEdOrgRefresh,
+} from '../admin-api-refresh-poll.util';
 import { StartingBlocksServiceV2 } from './starting-blocks.v2.service';
 import { adminApiLoginStatusMsgs } from '../../adminApiLoginFailureMsgs';
+import { resolveTenantNames } from '../../../../utils/api-metadata-utils';
+import { mergeResourceClaimsV2 } from './resource-claims-merge.v2';
+
+/**
+ * Error body shape returned by the Admin API on failed requests (e.g. registration/login).
+ */
+interface AdminApiErrorResponseBody {
+  message?: string;
+  errors?: Record<string, string[]> | string[];
+}
+
+/**
+ * A single education organization as returned by the Admin API's
+ * `odsInstances/edOrgs`-family endpoints (raw shape, not yet mapped to EducationOrganizationDto).
+ */
+interface AdminApiEducationOrganization {
+  educationOrganizationId: number;
+  nameOfInstitution: string;
+  shortNameOfInstitution?: string | null;
+  discriminator: string;
+  parentId?: number | null;
+}
+
+/**
+ * A single ODS instance as returned by the Admin API's `odsInstances/edOrgs`-family
+ * endpoints (raw shape, not yet mapped to OdsInstanceDto).
+ */
+interface AdminApiOdsInstance {
+  id: number | null;
+  name: string;
+  odsInstanceManageId?: number | null;
+  instanceType: string | null;
+  status?: string | null;
+  databaseTemplate?: string | null;
+  databaseName?: string | null;
+  educationOrganizations?: AdminApiEducationOrganization[];
+}
+
+/**
+ * Response shape of `tenants/{tenantName}/odsInstances/edOrgs`.
+ */
+interface TenantOdsInstancesEdOrgsResponse {
+  odsInstances?: AdminApiOdsInstance[];
+}
+
 /**
  * This service is used to interact with the Admin API. Each method is a single
  * API call (plus login if token is expired).
@@ -62,9 +134,17 @@ export class AdminApiServiceV2 {
     this.adminApiTokens = new NodeCache({ checkperiod: 60 });
   }
 
-  async login(edfiTenant: EdfiTenant) {
-    const configPublic = edfiTenant.sbEnvironment.configPublic;
-    const configPrivate = edfiTenant.sbEnvironment.configPrivate;
+  /**
+   * Generate a composite token key for tenant-specific authentication
+   * This ensures each tenant has its own token in the cache
+   */
+  private getTenantTokenKey(environmentId: number, tenantName: string): string {
+    return `${environmentId}-${tenantName}`;
+  }
+
+  async login(sbEnvironment: SbEnvironment, id: number, tenantName?: string) {
+    const configPublic = sbEnvironment.configPublic;
+    const configPrivate = sbEnvironment.configPrivate;
     const v2Config =
       'version' in configPublic && configPublic.version === 'v2' ? configPublic.values : undefined;
     const v2ConfigPrivate =
@@ -77,14 +157,34 @@ export class AdminApiServiceV2 {
         status: 'NO_CONFIG' as const,
       };
     }
-    if (!v2Config?.tenants[edfiTenant.name] || !v2ConfigPrivate?.tenants[edfiTenant.name]) {
+
+    // If no tenant name provided, try to find the first available tenant credentials
+    // This is needed for initial tenant discovery in EdFi environments
+    if (!tenantName) {
+      const availableTenants = v2Config.tenants ? Object.keys(v2Config.tenants) : [];
+      
+      if (availableTenants.length === 0) {
+        return {
+          status: 'NO_TENANT_CONFIG' as const,
+        };
+      }
+      
+      // Prefer 'default' tenant if available, otherwise use first tenant
+      tenantName = availableTenants.includes('default') 
+        ? 'default' 
+        : availableTenants[0];
+      
+      this.logger.log(`No tenant specified for login, using tenant: ${tenantName}`);
+    }
+
+    if (!v2Config?.tenants[tenantName] || !v2ConfigPrivate?.tenants[tenantName]) {
       return {
         status: 'NO_TENANT_CONFIG' as const,
       };
     }
-    const adminApiUrl = edfiTenant.sbEnvironment.adminApiUrl;
-    const adminApiKey = v2Config?.tenants[edfiTenant.name]?.adminApiKey;
-    const adminApiSecret = v2ConfigPrivate?.tenants[edfiTenant.name]?.adminApiSecret;
+    const adminApiUrl = sbEnvironment.adminApiUrl;
+    const adminApiKey = v2Config?.tenants[tenantName]?.adminApiKey;
+    const adminApiSecret = v2ConfigPrivate?.tenants[tenantName]?.adminApiSecret;
 
     if (typeof adminApiUrl !== 'string') {
       return {
@@ -101,7 +201,7 @@ export class AdminApiServiceV2 {
         status: 'NO_ADMIN_API_SECRET' as const,
       };
     }
-    let accessTokenUri = '';
+    let accessTokenUri: string;
     try {
       const url = new URL(adminApiUrl);
       url.pathname = url.pathname.replace(/\/$/, '') + '/connect/token';
@@ -119,19 +219,30 @@ export class AdminApiServiceV2 {
     reqBody.set('grant_type', 'client_credentials');
     reqBody.set('scope', 'edfi_admin_api/full_access');
 
-    const options = {
+    const options = tenantName ? {
       method: 'POST',
       url: accessTokenUri,
       headers: {
         Accept: 'application/json',
-        tenant: edfiTenant.name,
+        tenant: tenantName,
+      },
+      data: reqBody,
+    } : {
+      method: 'POST',
+      url: accessTokenUri,
+    headers: {
+        Accept: 'application/json',
+        tenant: tenantName,
       },
       data: reqBody,
     };
 
     try {
       await axios.request(options).then((v) => {
-        this.adminApiTokens.set(edfiTenant.id, v.data.access_token, Number(v.data.expires_in) - 60);
+        // Store token: environment-level (no tenant) uses just ID, tenant-specific uses composite key
+        const tokenKey = tenantName ? this.getTenantTokenKey(id, tenantName) : id;
+        this.adminApiTokens.set(tokenKey, v.data.access_token, Number(v.data.expires_in) - 60);
+        this.logger.log(`Stored token for environment ${id}${tenantName ? ` tenant ${tenantName}` : ' (environment-level)'} at key: ${tokenKey}`);
       });
       return {
         status: 'SUCCESS' as const,
@@ -212,8 +323,7 @@ export class AdminApiServiceV2 {
           );
           return { status: 'SUCCESS' as const };
         })
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        .catch((err: AxiosError<any>) => {
+        .catch((err: AxiosError<AdminApiErrorResponseBody>) => {
           if (err.response?.data?.errors) {
             this.logger.warn(JSON.stringify(err.response.data.errors));
             return {
@@ -235,30 +345,80 @@ export class AdminApiServiceV2 {
     );
   }
 
-  private getAdminApiClient(edfiTenant: EdfiTenant, notJustData?: boolean) {
-    const client = axios.create({
-      baseURL: edfiTenant.sbEnvironment.adminApiUrl.replace(/\/$/, '') + '/v2/',
-    });
-    client.interceptors.response.use(
-      notJustData
-        ? (value) => value
-        : (value) => {
-            return value.data;
-          },
-      (err) => {
-        if (err.response?.status === 401) {
-          this.adminApiTokens.del(edfiTenant.id);
-        }
-        this.logger.error(
-          `Unable to create client on ${edfiTenant.sbEnvironment.adminApiUrl}: ${err}`
-        );
-        throw err;
-      }
-    );
+  /**
+   * Get an authenticated API client for a specific tenant.
+   * Used by sync services to make tenant-specific Admin API calls.
+   * 
+   * @param edfiTenant - The tenant to get the client for
+   * @param notJustData - Whether to return full response or just data
+   * @returns Axios instance configured with tenant authentication
+   */
+  public getAdminApiClient(edfiTenant: EdfiTenant, notJustData?: boolean) {
+    const client = this.initializeApiClient(edfiTenant.sbEnvironment, notJustData);
     client.interceptors.request.use(async (config) => {
-      let token: undefined | string = this.adminApiTokens.get(edfiTenant.id);
+      // Use composite key for tenant-specific token retrieval
+      const tokenKey = this.getTenantTokenKey(edfiTenant.sbEnvironment.id, edfiTenant.name);
+      let token: undefined | string = this.adminApiTokens.get(tokenKey);
       if (token === undefined) {
-        const adminLogin = await this.login(edfiTenant);
+        this.logger.log(`No cached token found for tenant ${edfiTenant.name}, attempting login...`);
+        const adminLogin = await this.login(edfiTenant.sbEnvironment, edfiTenant.sbEnvironment.id, edfiTenant.name);
+
+        if (adminLogin.status !== 'SUCCESS') {
+          const errorMsg = adminApiLoginStatusMsgs[adminLogin.status];
+          this.logger.error(
+            `Authentication failed for tenant ${edfiTenant.name}: ${adminLogin.status} - ${errorMsg}`
+          );
+          throw new CustomHttpException(
+            {
+              title: `Authentication failed for tenant ${edfiTenant.name}`,
+              type: 'Error',
+              message: `${adminLogin.status}: ${errorMsg}`,
+            },
+            500
+          );
+        }
+        token = this.adminApiTokens.get(tokenKey);
+        this.logger.log(`Successfully authenticated tenant ${edfiTenant.name}`);
+      }
+      config.headers.Authorization = `Bearer ${token}`;
+      config.headers.tenant = edfiTenant.name;
+      return config;
+    });
+    return client;
+  }
+
+  /**
+   * Get an authenticated API client for a specific environment.
+   * For multi-tenant environments, uses the first available tenant's credentials
+   * and includes the tenant header so environment-level endpoints (e.g. EdOrg refresh,
+   * job status polling) are accepted by the Admin API.
+   *
+   * @param sbEnvironment - The Starting Blocks environment to authenticate against
+   * @returns Axios instance configured with environment-level authentication
+   */
+  public getAdminApiClientForEnvironment(sbEnvironment: SbEnvironment) {
+    const configPublic = sbEnvironment.configPublic;
+    const v2Config =
+      'version' in configPublic && configPublic.version === 'v2' ? configPublic.values : undefined;
+    const availableTenants = v2Config?.tenants ? Object.keys(v2Config.tenants) : [];
+    const tenantName =
+      availableTenants.length > 0
+        ? availableTenants.includes('default')
+          ? 'default'
+          : availableTenants[0]
+        : undefined;
+    return this.getAdminApiClientUsingEnv(sbEnvironment, undefined, tenantName);
+  }
+
+  private getAdminApiClientUsingEnv(environment: SbEnvironment, notJustData?: boolean, tenantName?: string) {
+    const client = this.initializeApiClient(environment, notJustData);
+    client.interceptors.request.use(async (config) => {
+      const tokenKey = tenantName
+        ? this.getTenantTokenKey(environment.id, tenantName)
+        : environment.id;
+      let token: undefined | string = this.adminApiTokens.get(tokenKey);
+      if (token === undefined) {
+        const adminLogin = await this.login(environment, environment.id, tenantName);
 
         if (adminLogin.status !== 'SUCCESS') {
           throw new CustomHttpException(
@@ -269,20 +429,35 @@ export class AdminApiServiceV2 {
             500
           );
         }
-        token = this.adminApiTokens.get(edfiTenant.id);
+        token = this.adminApiTokens.get(tokenKey);
       }
       config.headers.Authorization = `Bearer ${token}`;
-      config.headers.tenant = edfiTenant.name;
+      if (tenantName) {
+        config.headers.tenant = tenantName;
+      }
       return config;
     });
     return client;
   }
 
+  private initializeApiClient(environment: SbEnvironment, notJustData?: boolean) {
+    const client = axios.create({
+      baseURL: environment.adminApiUrl.replace(/\/$/, '') + '/v2/',
+    });
+    client.interceptors.response.use(
+      notJustData
+        ? (value) => value
+        : (value) => {
+          return value.data;
+        }
+    );
+    return client;
+  }
+
   async getActions(edfiTenant: EdfiTenant) {
     return toGetActionDtoV2(
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
       await this.getAdminApiClient(edfiTenant)
-        .get<any, any[]>(`actions?offset=0&limit=10000`)
+        .get<GetActionDtoV2[], GetActionDtoV2[]>(`actions?offset=0&limit=10000`)
         .catch((err) => {
           this.logger.error(`Error getting actions for tenant ${edfiTenant.id}: ${err}`);
           throw err;
@@ -292,9 +467,8 @@ export class AdminApiServiceV2 {
 
   async getApplications(edfiTenant: EdfiTenant) {
     return toGetApplicationDtoV2(
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
       await this.getAdminApiClient(edfiTenant)
-        .get<any, any[]>(`applications?offset=0&limit=10000`)
+        .get<GetApplicationDtoV2[], GetApplicationDtoV2[]>(`applications?offset=0&limit=10000`)
         .catch((err) => {
           this.logger.error(`Error getting applications for tenant ${edfiTenant.id}: ${err}`);
           throw err;
@@ -304,25 +478,28 @@ export class AdminApiServiceV2 {
 
   async postApplication(edfiTenant: EdfiTenant, application: PostApplicationDtoV2) {
     return toPostApplicationResponseDtoV2(
-      (await this.getAdminApiClient(edfiTenant)
-        .post(`applications`, application)
+      await this.getAdminApiClient(edfiTenant)
+        .post<PostApplicationResponseDtoV2, PostApplicationResponseDtoV2>(
+          `applications`,
+          application
+        )
         .catch((err) => {
           this.logger.error(`Error creating application for tenant ${edfiTenant.id}: ${err}`);
           throw err;
-        })) as any
+        })
     );
   }
 
   async getApplication(edfiTenant: EdfiTenant, applicationId: number) {
     return toGetApplicationDtoV2(
-      (await this.getAdminApiClient(edfiTenant)
-        .get(`applications/${applicationId}`)
+      await this.getAdminApiClient(edfiTenant)
+        .get<GetApplicationDtoV2, GetApplicationDtoV2>(`applications/${applicationId}`)
         .catch((err) => {
           this.logger.error(
             `Error getting application ${applicationId} for tenant ${edfiTenant.id}: ${err}`
           );
           throw err;
-        })) as any
+        })
     );
   }
 
@@ -332,14 +509,17 @@ export class AdminApiServiceV2 {
     application: PutApplicationDtoV2
   ) {
     return toGetApplicationDtoV2(
-      (await this.getAdminApiClient(edfiTenant)
-        .put(`applications/${applicationId}`, application)
+      await this.getAdminApiClient(edfiTenant)
+        .put<GetApplicationDtoV2, GetApplicationDtoV2>(
+          `applications/${applicationId}`,
+          application
+        )
         .catch((err) => {
           this.logger.error(
             `Error updating application ${applicationId} for tenant ${edfiTenant.id}: ${err}`
           );
           throw err;
-        })) as any
+        })
     );
   }
 
@@ -357,22 +537,105 @@ export class AdminApiServiceV2 {
 
   async putApplicationResetCredential(edfiTenant: EdfiTenant, applicationId: number) {
     return toPostApplicationResponseDtoV2(
-      (await this.getAdminApiClient(edfiTenant)
-        .put(`applications/${applicationId}/reset-credential`)
+      await this.getAdminApiClient(edfiTenant)
+        .put<PostApplicationResponseDtoV2, PostApplicationResponseDtoV2>(
+          `applications/${applicationId}/reset-credential`
+        )
         .catch((err) => {
           this.logger.error(
             `Error resetting application credential for application ${applicationId} for tenant ${edfiTenant.id}: ${err}`
           );
           throw err;
-        })) as any
+        })
     );
+  }
+
+  async getApiClients(edfiTenant: EdfiTenant, applicationId: number) {
+    return toGetApiClientDtoV2(
+      await this.getAdminApiClient(edfiTenant)
+        .get<GetApiClientDtoV2[], GetApiClientDtoV2[]>(
+          `apiClients?offset=0&limit=10000&applicationId=${applicationId}`
+        )
+        .catch((err) => {
+          this.logger.error(`Error getting API clients for tenant ${edfiTenant.id}: ${err}`);
+          throw err;
+        })
+    );
+  }
+
+  async getApiClient(edfiTenant: EdfiTenant, apiClientId: number) {
+    return toGetApiClientDtoV2(
+      await this.getAdminApiClient(edfiTenant)
+        .get<GetApiClientDtoV2, GetApiClientDtoV2>(`apiClients/${apiClientId}`)
+        .catch((err) => {
+          this.logger.error(
+            `Error getting API client ${apiClientId} for tenant ${edfiTenant.id}: ${err}`
+          );
+          throw err;
+        })
+    );
+  }
+
+  async putApiClient(edfiTenant: EdfiTenant, apiClientId: number, apiClient: PutApiClientDtoV2) {
+    return toGetApiClientDtoV2(
+      await this.getAdminApiClient(edfiTenant)
+        .put<GetApiClientDtoV2, GetApiClientDtoV2>(`apiClients/${apiClientId}`, apiClient)
+        .catch((err) => {
+          this.logger.error(
+            `Error updating API client ${apiClientId} for tenant ${edfiTenant.id}: ${err}`
+          );
+          throw err;
+        })
+    );
+  }
+
+  async postApiClient(
+     edfiTenant: EdfiTenant,
+     apiClient: PostApiClientDtoV2
+   ): Promise<PostApiClientResponseDtoV2> {
+     return toPostApiClientResponseDtoV2(
+       await this.getAdminApiClient(edfiTenant)
+         .post<PostApiClientResponseDtoV2, PostApiClientResponseDtoV2>(`apiClients`, apiClient)
+         .catch((err) => {
+           this.logger.error(`Error creating API client for tenant ${edfiTenant.id}: ${err}`);
+           throw err;
+         })
+     );
+  }
+
+  async putApiClientResetCredential(edfiTenant: EdfiTenant, apiClientId: number) {
+    return toPostApiClientResponseDtoV2(
+      await this.getAdminApiClient(edfiTenant)
+        .put<PostApiClientResponseDtoV2, PostApiClientResponseDtoV2>(
+          `apiClients/${apiClientId}/reset-credential`
+        )
+        .catch((err) => {
+          this.logger.error(
+            `Error resetting API client credential for API client ${apiClientId} for tenant ${edfiTenant.id}: ${err}`
+          );
+          throw err;
+        })
+    );
+  }
+
+  async deleteApiClient(edfiTenant: EdfiTenant, apiClientId: number) {
+    await this.getAdminApiClient(edfiTenant)
+      .delete(`apiClients/${apiClientId}`)
+      .catch((err) => {
+        this.logger.error(
+          `Error deleting API client ${apiClientId} for tenant ${edfiTenant.id}: ${err}`
+        );
+        throw err;
+      });
+    return undefined;
   }
 
   async getAuthorizationStrategies(edfiTenant: EdfiTenant) {
     return toGetAuthStrategyDtoV2(
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
       await this.getAdminApiClient(edfiTenant)
-        .get<any, any[]>(`authorizationStrategies?offset=0&limit=10000`)
+        .get<GetAuthStrategyDtoV2[], GetAuthStrategyDtoV2[]>(
+          `authorizationStrategies?offset=0&limit=10000`
+        )
         .catch((err) => {
           this.logger.error(
             `Error getting authorization strategies for tenant ${edfiTenant.id}: ${err}`
@@ -384,9 +647,10 @@ export class AdminApiServiceV2 {
 
   async getClaimsets(edfiTenant: EdfiTenant) {
     return toGetClaimsetMultipleDtoV2(
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
       await this.getAdminApiClient(edfiTenant)
-        .get<any, any[]>(`claimSets?offset=0&limit=10000`)
+        .get<GetClaimsetMultipleDtoV2[], GetClaimsetMultipleDtoV2[]>(
+          `claimSets?offset=0&limit=10000`
+        )
         .catch((err) => {
           this.logger.error(`Error getting claimsets for tenant ${edfiTenant.id}: ${err}`);
           throw err;
@@ -396,38 +660,81 @@ export class AdminApiServiceV2 {
 
   async postClaimset(edfiTenant: EdfiTenant, claimSet: PostClaimsetDtoV2) {
     return toGetClaimsetSingleDtoV2(
-      (await this.getAdminApiClient(edfiTenant)
-        .post(`claimSets`, claimSet)
+      await this.getAdminApiClient(edfiTenant)
+        .post<GetClaimsetSingleDtoV2, GetClaimsetSingleDtoV2>(`claimSets`, claimSet)
         .catch((err) => {
           this.logger.error(`Error creating claimset for tenant ${edfiTenant.id}: ${err}`);
           throw err;
-        })) as any
+        })
+    );
+  }
+
+  // The plain single-endpoint fetch, without the AC-439 resourceClaims
+  // hierarchy merge below. Use this for callers that only need top-level
+  // claimset fields (e.g. validating `_isSystemReserved` before creating or
+  // updating an Application) — merging pulls up to 10,000 unrelated
+  // resourceClaims and would make those validation-only callers fail
+  // whenever that endpoint has trouble, for no benefit to them.
+  async getClaimsetBasic(edfiTenant: EdfiTenant, claimSetId: number) {
+    const validatedClaimSetId = Number(claimSetId);
+    if (!Number.isSafeInteger(validatedClaimSetId) || validatedClaimSetId <= 0) {
+      throw new CustomHttpException({ title: 'Invalid claimsetId', type: 'Error' }, 400);
+    }
+
+    return toGetClaimsetSingleDtoV2(
+      await this.getAdminApiClient(edfiTenant)
+        .get<GetClaimsetSingleDtoV2, GetClaimsetSingleDtoV2>(
+          `claimSets/${validatedClaimSetId}`
+        )
+        .catch((err) => {
+          this.logger.error(
+            `Error getting claimset ${validatedClaimSetId} for tenant ${edfiTenant.id}: ${err}`
+          );
+          throw err;
+        })
     );
   }
 
   async getClaimset(edfiTenant: EdfiTenant, claimSetId: number) {
-    return toGetClaimsetSingleDtoV2(
-      (await this.getAdminApiClient(edfiTenant)
-        .get(`claimSets/${claimSetId}`)
-        .catch((err) => {
-          this.logger.error(
-            `Error getting claimset ${claimSetId} for tenant ${edfiTenant.id}: ${err}`
-          );
-          throw err;
-        })) as any
-    );
+    const [claimset, allResourceClaims] = await Promise.all([
+      this.getClaimsetBasic(edfiTenant, claimSetId),
+      // AC-439: Admin Api excludes any resourceClaims item (at any depth)
+      // that has no actions associated. Fetch the complete hierarchy
+      // separately so those items can be merged back in as denied. If this
+      // fetch has trouble, fall back to the claimset's own (possibly
+      // pruned) resourceClaims instead of failing the whole request —
+      // losing the "denied" enrichment beats a blank claimset page.
+      this.getResourceClaims(edfiTenant).catch((err) => {
+        this.logger.warn(
+          `Could not fetch the full resourceClaims hierarchy for tenant ${edfiTenant.id}; showing claimset ${claimSetId} without AC-439 enrichment: ${err}`
+        );
+        return null;
+      }),
+    ]);
+
+    if (allResourceClaims === null) {
+      return claimset;
+    }
+
+    return toGetClaimsetSingleDtoV2({
+      ...claimset,
+      resourceClaims: mergeResourceClaimsV2(claimset.resourceClaims, allResourceClaims),
+    } as GetClaimsetSingleDtoV2);
   }
 
   async putClaimset(edfiTenant: EdfiTenant, claimSetId: number, claimSet: PutClaimsetDtoV2) {
     return toGetClaimsetSingleDtoV2(
-      (await this.getAdminApiClient(edfiTenant)
-        .put(`claimSets/${claimSetId}`, claimSet)
+      await this.getAdminApiClient(edfiTenant)
+        .put<GetClaimsetSingleDtoV2, GetClaimsetSingleDtoV2>(
+          `claimSets/${claimSetId}`,
+          claimSet
+        )
         .catch((err) => {
           this.logger.error(
             `Error updating claimset ${claimSetId} for tenant ${edfiTenant.id}: ${err}`
           );
           throw err;
-        })) as any
+        })
     );
   }
 
@@ -449,14 +756,17 @@ export class AdminApiServiceV2 {
     resourceClaimAction: PostClaimsetResourceClaimActionsDtoV2
   ) {
     return toGetClaimsetSingleDtoV2(
-      (await this.getAdminApiClient(edfiTenant)
-        .post(`claimSets/${claimSetId}/resourceClaimActions`, resourceClaimAction)
+      await this.getAdminApiClient(edfiTenant)
+        .post<GetClaimsetSingleDtoV2, GetClaimsetSingleDtoV2>(
+          `claimSets/${claimSetId}/resourceClaimActions`,
+          resourceClaimAction
+        )
         .catch((err) => {
           this.logger.error(
             `Error creating claimset ${claimSetId} resource claim action for tenant ${edfiTenant.id}: ${err}`
           );
           throw err;
-        })) as any
+        })
     );
   }
 
@@ -467,14 +777,17 @@ export class AdminApiServiceV2 {
     resourceClaimAction: PutClaimsetResourceClaimActionsDtoV2
   ) {
     return toGetClaimsetSingleDtoV2(
-      (await this.getAdminApiClient(edfiTenant)
-        .put(`claimSets/${claimSetId}/resourceClaimActions/${resourceClaimId}`, resourceClaimAction)
+      await this.getAdminApiClient(edfiTenant)
+        .put<GetClaimsetSingleDtoV2, GetClaimsetSingleDtoV2>(
+          `claimSets/${claimSetId}/resourceClaimActions/${resourceClaimId}`,
+          resourceClaimAction
+        )
         .catch((err) => {
           this.logger.error(
             `Error updating claimset ${claimSetId} resource claim action for tenant ${edfiTenant.id}: ${err}`
           );
           throw err;
-        })) as any
+        })
     );
   }
 
@@ -485,8 +798,8 @@ export class AdminApiServiceV2 {
     overrideAuthorizationStrategy: PostActionAuthStrategiesDtoV2
   ) {
     return toGetClaimsetSingleDtoV2(
-      (await this.getAdminApiClient(edfiTenant)
-        .post(
+      await this.getAdminApiClient(edfiTenant)
+        .post<GetClaimsetSingleDtoV2, GetClaimsetSingleDtoV2>(
           `claimSets/${claimSetId}/resourceClaimActions/${resourceClaimId}/overrideAuthorizationStrategy`,
           overrideAuthorizationStrategy
         )
@@ -495,7 +808,7 @@ export class AdminApiServiceV2 {
             `Error updating claimset ${claimSetId} resource claim ${resourceClaimId} action for tenant ${edfiTenant.id}: ${err}`
           );
           throw err;
-        })) as any
+        })
     );
   }
 
@@ -505,8 +818,8 @@ export class AdminApiServiceV2 {
     resourceClaimId: number
   ) {
     return toGetClaimsetSingleDtoV2(
-      (await this.getAdminApiClient(edfiTenant)
-        .post(
+      await this.getAdminApiClient(edfiTenant)
+        .post<GetClaimsetSingleDtoV2, GetClaimsetSingleDtoV2>(
           `claimSets/${claimSetId}/resourceClaimActions/${resourceClaimId}/resetAuthorizationStrategies`
         )
         .catch((err) => {
@@ -514,7 +827,7 @@ export class AdminApiServiceV2 {
             `Error resetting authorization strategies for resourceClaimId ${resourceClaimId} for tenant ${edfiTenant.id}: ${err}`
           );
           throw err;
-        })) as any
+        })
     );
   }
 
@@ -524,14 +837,16 @@ export class AdminApiServiceV2 {
     resourceClaimId: number
   ) {
     return toGetClaimsetSingleDtoV2(
-      (await this.getAdminApiClient(edfiTenant)
-        .delete(`claimSets/${claimSetId}/resourceClaimActions/${resourceClaimId}`)
+      await this.getAdminApiClient(edfiTenant)
+        .delete<GetClaimsetSingleDtoV2, GetClaimsetSingleDtoV2>(
+          `claimSets/${claimSetId}/resourceClaimActions/${resourceClaimId}`
+        )
         .catch((err) => {
           this.logger.error(
             `Error deleting claimset ${claimSetId} resource claim action ${resourceClaimId} for tenant ${edfiTenant.id}: ${err}`
           );
           throw err;
-        })) as any
+        })
     );
   }
 
@@ -557,20 +872,21 @@ export class AdminApiServiceV2 {
 
   async exportClaimset(edfiTenant: EdfiTenant, claimSetId: number) {
     return toGetClaimsetSingleDtoV2(
-      (await this.getAdminApiClient(edfiTenant)
-        .get(`claimSets/${claimSetId}/export`)
+      await this.getAdminApiClient(edfiTenant)
+        .get<GetClaimsetSingleDtoV2, GetClaimsetSingleDtoV2>(`claimSets/${claimSetId}/export`)
         .catch((err) => {
           this.logger.error(`Error exporting claimset for tenant ${edfiTenant.id}: ${err}`);
           throw err;
-        })) as any
+        })
     );
   }
 
   async getOdsInstances(edfiTenant: EdfiTenant) {
     return toGetOdsInstanceSummaryDtoV2(
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
       await this.getAdminApiClient(edfiTenant)
-        .get<any, any[]>(`odsInstances?offset=0&limit=10000`)
+        .get<GetOdsInstanceSummaryDtoV2[], GetOdsInstanceSummaryDtoV2[]>(
+          `odsInstances?offset=0&limit=10000`
+        )
         .catch((err) => {
           this.logger.error(`Error getting ODS instances for tenant ${edfiTenant.id}: ${err}`);
           throw err;
@@ -580,25 +896,57 @@ export class AdminApiServiceV2 {
 
   async postOdsInstance(edfiTenant: EdfiTenant, odsInstance: PostOdsInstanceDtoV2) {
     return toGetOdsInstanceDetailDtoV2(
-      (await this.getAdminApiClient(edfiTenant)
-        .post(`odsInstances`, odsInstance)
+      await this.getAdminApiClient(edfiTenant)
+        .post<GetOdsInstanceDetailDtoV2, GetOdsInstanceDetailDtoV2>(`odsInstances`, odsInstance)
         .catch((err) => {
           this.logger.error(`Error creating ODS instance for tenant ${edfiTenant.id}: ${err}`);
           throw err;
-        })) as any
+        })
     );
+  }
+
+  async postInstance(edfiTenant: EdfiTenant, instance: PostInstanceDtoV2) {
+    const { headers } = await this.getAdminApiClient(edfiTenant, true)
+      .post('odsInstances/manage', instance)
+      .catch((err) => {
+        this.logger.error(`Error creating instance for tenant ${edfiTenant.id}: ${err}`);
+        throw err;
+      });
+    const location = headers?.location;
+    const match = typeof location === 'string' ? location.match(/\d+$/) : null;
+    if (!match) {
+      this.logger.error(
+        `Error creating instance for tenant ${edfiTenant.id}: missing/invalid Location header (${String(location)})`
+      );
+      throw new Error('Admin API did not return a Location header containing the created instance id.');
+    }
+    return { id: Number(match[0]) };
+  }
+
+  async deleteInstance(edfiTenant: EdfiTenant, instanceManageId: number) {
+    await this.getAdminApiClient(edfiTenant, true)
+      .delete(`odsInstances/manage/${instanceManageId}`)
+      .catch((err) => {
+        this.logger.error(
+          `Error deleting instance ${instanceManageId} for tenant ${edfiTenant.id}: ${err}`
+        );
+        throw err;
+      });
+    return undefined;
   }
 
   async getOdsInstance(edfiTenant: EdfiTenant, odsInstanceId: number) {
     return toGetOdsInstanceDetailDtoV2(
-      (await this.getAdminApiClient(edfiTenant)
-        .get(`odsInstances/${odsInstanceId}`)
+      await this.getAdminApiClient(edfiTenant)
+        .get<GetOdsInstanceDetailDtoV2, GetOdsInstanceDetailDtoV2>(
+          `odsInstances/${odsInstanceId}`
+        )
         .catch((err) => {
           this.logger.error(
             `Error getting ODS instance ${odsInstanceId} for tenant ${edfiTenant.id}: ${err}`
           );
           throw err;
-        })) as any
+        })
     );
   }
 
@@ -608,14 +956,17 @@ export class AdminApiServiceV2 {
     odsInstance: PutOdsInstanceDtoV2
   ) {
     return toGetOdsInstanceDetailDtoV2(
-      (await this.getAdminApiClient(edfiTenant)
-        .put(`odsInstances/${odsInstanceId}`, odsInstance)
+      await this.getAdminApiClient(edfiTenant)
+        .put<GetOdsInstanceDetailDtoV2, GetOdsInstanceDetailDtoV2>(
+          `odsInstances/${odsInstanceId}`,
+          odsInstance
+        )
         .catch((err) => {
           this.logger.error(
             `Error updating ODS instance ${odsInstanceId} for tenant ${edfiTenant.id}: ${err}`
           );
           throw err;
-        })) as any
+        })
     );
   }
 
@@ -632,10 +983,15 @@ export class AdminApiServiceV2 {
   }
 
   async getOdsInstanceApplications(edfiTenant: EdfiTenant, odsInstanceId: number) {
+    // Note: this endpoint's raw shape actually matches GetApplicationAssignedToOdsInstanceDtoV2
+    // (a singular `odsInstanceId` rather than `odsInstanceIds`), but the response is passed
+    // through the same toGetApplicationDtoV2 wrapper used by the other application-list
+    // methods in this file, so it is typed to match that wrapper's expected input here.
     return toGetApplicationDtoV2(
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
       await this.getAdminApiClient(edfiTenant)
-        .get<any, any[]>(`odsInstances/${odsInstanceId}/applications?offset=0&limit=10000`)
+        .get<GetApplicationDtoV2[], GetApplicationDtoV2[]>(
+          `odsInstances/${odsInstanceId}/applications?offset=0&limit=10000`
+        )
         .catch((err) => {
           this.logger.error(
             `Error getting applications for ODS Instance ${odsInstanceId} for tenant ${edfiTenant.id}: ${err}`
@@ -647,9 +1003,10 @@ export class AdminApiServiceV2 {
 
   async getOdsInstanceContexts(edfiTenant: EdfiTenant) {
     return toGetOdsInstanceContextDtoV2(
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
       await this.getAdminApiClient(edfiTenant)
-        .get<any, any[]>(`odsInstanceContexts?offset=0&limit=10000`)
+        .get<GetOdsInstanceContextDtoV2[], GetOdsInstanceContextDtoV2[]>(
+          `odsInstanceContexts?offset=0&limit=10000`
+        )
         .catch((err) => {
           this.logger.error(
             `Error getting ODS instance contexts for tenant ${edfiTenant.id}: ${err}`
@@ -664,27 +1021,32 @@ export class AdminApiServiceV2 {
     odsInstanceContext: PostOdsInstanceContextDtoV2
   ) {
     return toGetOdsInstanceContextDtoV2(
-      (await this.getAdminApiClient(edfiTenant)
-        .post(`odsInstanceContexts`, odsInstanceContext)
+      await this.getAdminApiClient(edfiTenant)
+        .post<GetOdsInstanceContextDtoV2, GetOdsInstanceContextDtoV2>(
+          `odsInstanceContexts`,
+          odsInstanceContext
+        )
         .catch((err) => {
           this.logger.error(
             `Error creating ODS instance context for tenant ${edfiTenant.id}: ${err}`
           );
           throw err;
-        })) as any
+        })
     );
   }
 
   async getOdsInstanceContext(edfiTenant: EdfiTenant, odsInstanceContextId: number) {
     return toGetOdsInstanceContextDtoV2(
-      (await this.getAdminApiClient(edfiTenant)
-        .get(`odsInstanceContexts/${odsInstanceContextId}`)
+      await this.getAdminApiClient(edfiTenant)
+        .get<GetOdsInstanceContextDtoV2, GetOdsInstanceContextDtoV2>(
+          `odsInstanceContexts/${odsInstanceContextId}`
+        )
         .catch((err) => {
           this.logger.error(
             `Error getting ODS instance context ${odsInstanceContextId} for tenant ${edfiTenant.id}: ${err}`
           );
           throw err;
-        })) as any
+        })
     );
   }
 
@@ -694,14 +1056,17 @@ export class AdminApiServiceV2 {
     odsInstanceContext: PutOdsInstanceContextDtoV2
   ) {
     return toGetOdsInstanceContextDtoV2(
-      (await this.getAdminApiClient(edfiTenant)
-        .put(`odsInstanceContexts/${odsInstanceContextId}`, odsInstanceContext)
+      await this.getAdminApiClient(edfiTenant)
+        .put<GetOdsInstanceContextDtoV2, GetOdsInstanceContextDtoV2>(
+          `odsInstanceContexts/${odsInstanceContextId}`,
+          odsInstanceContext
+        )
         .catch((err) => {
           this.logger.error(
             `Error updating ODS instance context ${odsInstanceContextId} for tenant ${edfiTenant.id}: ${err}`
           );
           throw err;
-        })) as any
+        })
     );
   }
 
@@ -719,9 +1084,10 @@ export class AdminApiServiceV2 {
 
   async getOdsInstanceDerivatives(edfiTenant: EdfiTenant) {
     return toGetOdsInstanceDerivativeDtoV2(
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
       await this.getAdminApiClient(edfiTenant)
-        .get<any, any[]>(`odsInstanceDerivatives?offset=0&limit=10000`)
+        .get<GetOdsInstanceDerivativeDtoV2[], GetOdsInstanceDerivativeDtoV2[]>(
+          `odsInstanceDerivatives?offset=0&limit=10000`
+        )
         .catch((err) => {
           this.logger.error(
             `Error getting ODS instance derivatives for tenant ${edfiTenant.id}: ${err}`
@@ -736,27 +1102,32 @@ export class AdminApiServiceV2 {
     odsInstanceDerivative: PostOdsInstanceDerivativeDtoV2
   ) {
     return toGetOdsInstanceDerivativeDtoV2(
-      (await this.getAdminApiClient(edfiTenant)
-        .post(`odsInstanceDerivatives`, odsInstanceDerivative)
+      await this.getAdminApiClient(edfiTenant)
+        .post<GetOdsInstanceDerivativeDtoV2, GetOdsInstanceDerivativeDtoV2>(
+          `odsInstanceDerivatives`,
+          odsInstanceDerivative
+        )
         .catch((err) => {
           this.logger.error(
             `Error creating ODS instance derivative for tenant ${edfiTenant.id}: ${err}`
           );
           throw err;
-        })) as any
+        })
     );
   }
 
   async getOdsInstanceDerivative(edfiTenant: EdfiTenant, odsInstanceDerivativeId: number) {
     return toGetOdsInstanceDerivativeDtoV2(
-      (await this.getAdminApiClient(edfiTenant)
-        .get(`odsInstanceDerivatives/${odsInstanceDerivativeId}`)
+      await this.getAdminApiClient(edfiTenant)
+        .get<GetOdsInstanceDerivativeDtoV2, GetOdsInstanceDerivativeDtoV2>(
+          `odsInstanceDerivatives/${odsInstanceDerivativeId}`
+        )
         .catch((err) => {
           this.logger.error(
             `Error getting ODS instance derivative ${odsInstanceDerivativeId} for tenant ${edfiTenant.id}: ${err}`
           );
           throw err;
-        })) as any
+        })
     );
   }
 
@@ -766,14 +1137,17 @@ export class AdminApiServiceV2 {
     odsInstanceDerivative: PutOdsInstanceDerivativeDtoV2
   ) {
     return toGetOdsInstanceDerivativeDtoV2(
-      (await this.getAdminApiClient(edfiTenant)
-        .put(`odsInstanceDerivatives/${odsInstanceDerivativeId}`, odsInstanceDerivative)
+      await this.getAdminApiClient(edfiTenant)
+        .put<GetOdsInstanceDerivativeDtoV2, GetOdsInstanceDerivativeDtoV2>(
+          `odsInstanceDerivatives/${odsInstanceDerivativeId}`,
+          odsInstanceDerivative
+        )
         .catch((err) => {
           this.logger.error(
             `Error updating ODS instance derivative ${odsInstanceDerivativeId} for tenant ${edfiTenant.id}: ${err}`
           );
           throw err;
-        })) as any
+        })
     );
   }
 
@@ -791,9 +1165,8 @@ export class AdminApiServiceV2 {
 
   async getProfiles(edfiTenant: EdfiTenant) {
     return toGetProfileDtoV2(
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
       await this.getAdminApiClient(edfiTenant)
-        .get<any, any[]>(`profiles?offset=0&limit=10000`)
+        .get<GetProfileDtoV2[], GetProfileDtoV2[]>(`profiles?offset=0&limit=10000`)
         .catch((err) => {
           this.logger.error(`Error getting profiles for tenant ${edfiTenant.id}: ${err}`);
           throw err;
@@ -813,27 +1186,27 @@ export class AdminApiServiceV2 {
 
   async getProfile(edfiTenant: EdfiTenant, profileId: number) {
     return toGetProfileDtoV2(
-      (await this.getAdminApiClient(edfiTenant)
-        .get(`profiles/${profileId}`)
+      await this.getAdminApiClient(edfiTenant)
+        .get<GetProfileDtoV2, GetProfileDtoV2>(`profiles/${profileId}`)
         .catch((err) => {
           this.logger.error(
             `Error getting profile ${profileId} for tenant ${edfiTenant.id}: ${err}`
           );
           throw err;
-        })) as any
+        })
     );
   }
 
   async putProfile(edfiTenant: EdfiTenant, profileId: number, profile: PutProfileDtoV2) {
     return toGetProfileDtoV2(
-      (await this.getAdminApiClient(edfiTenant)
-        .put(`profiles/${profileId}`, profile)
+      await this.getAdminApiClient(edfiTenant)
+        .put<GetProfileDtoV2, GetProfileDtoV2>(`profiles/${profileId}`, profile)
         .catch((err) => {
           this.logger.error(
             `Error updating profile ${profileId} for tenant ${edfiTenant.id}: ${err}`
           );
           throw err;
-        })) as any
+        })
     );
   }
 
@@ -851,9 +1224,10 @@ export class AdminApiServiceV2 {
 
   async getResourceClaims(edfiTenant: EdfiTenant) {
     return toGetResourceClaimDetailDtoV2(
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
       await this.getAdminApiClient(edfiTenant)
-        .get<any, any[]>(`resourceClaims?offset=0&limit=10000`)
+        .get<GetResourceClaimDetailDtoV2[], GetResourceClaimDetailDtoV2[]>(
+          `resourceClaims?offset=0&limit=10000`
+        )
         .catch((err) => {
           this.logger.error(`Error getting resource claims for tenant ${edfiTenant.id}: ${err}`);
           throw err;
@@ -863,22 +1237,23 @@ export class AdminApiServiceV2 {
 
   async getResourceClaim(edfiTenant: EdfiTenant, resourceClaimId: number) {
     return toGetResourceClaimDetailDtoV2(
-      (await this.getAdminApiClient(edfiTenant)
-        .get(`resourceClaims/${resourceClaimId}`)
+      await this.getAdminApiClient(edfiTenant)
+        .get<GetResourceClaimDetailDtoV2, GetResourceClaimDetailDtoV2>(
+          `resourceClaims/${resourceClaimId}`
+        )
         .catch((err) => {
           this.logger.error(
             `Error getting resource claim ${resourceClaimId} for tenant ${edfiTenant.id}: ${err}`
           );
           throw err;
-        })) as any
+        })
     );
   }
 
   async getVendors(edfiTenant: EdfiTenant) {
     return toGetVendorDtoV2(
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
       await this.getAdminApiClient(edfiTenant)
-        .get<any, any[]>(`vendors?offset=0&limit=10000`)
+        .get<GetVendorDtoV2[], GetVendorDtoV2[]>(`vendors?offset=0&limit=10000`)
         .catch((err) => {
           this.logger.error(`Error getting vendors for tenant ${edfiTenant.id}: ${err}`);
           throw err;
@@ -898,25 +1273,25 @@ export class AdminApiServiceV2 {
 
   async getVendor(edfiTenant: EdfiTenant, vendorId: number) {
     return toGetVendorDtoV2(
-      (await this.getAdminApiClient(edfiTenant)
-        .get(`vendors/${vendorId}`)
+      await this.getAdminApiClient(edfiTenant)
+        .get<GetVendorDtoV2, GetVendorDtoV2>(`vendors/${vendorId}`)
         .catch((err) => {
           this.logger.error(`Error getting vendor ${vendorId} for tenant ${edfiTenant.id}: ${err}`);
           throw err;
-        })) as any
+        })
     );
   }
 
   async putVendor(edfiTenant: EdfiTenant, vendorId: number, vendor: PutVendorDtoV2) {
     return toGetVendorDtoV2(
-      (await this.getAdminApiClient(edfiTenant)
-        .put(`vendors/${vendorId}`, vendor)
+      await this.getAdminApiClient(edfiTenant)
+        .put<GetVendorDtoV2, GetVendorDtoV2>(`vendors/${vendorId}`, vendor)
         .catch((err) => {
           this.logger.error(
             `Error updating vendor ${vendorId} for tenant ${edfiTenant.id}: ${err}`
           );
           throw err;
-        })) as any
+        })
     );
   }
 
@@ -932,9 +1307,10 @@ export class AdminApiServiceV2 {
 
   async getVendorApplications(edfiTenant: EdfiTenant, vendorId: number) {
     return toGetApplicationDtoV2(
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
       await this.getAdminApiClient(edfiTenant)
-        .get<any, any[]>(`vendors/${vendorId}/applications?offset=0&limit=10000`)
+        .get<GetApplicationDtoV2[], GetApplicationDtoV2[]>(
+          `vendors/${vendorId}/applications?offset=0&limit=10000`
+        )
         .catch((err) => {
           this.logger.error(
             `Error getting vendor applications for vendor ${vendorId} and tenant ${edfiTenant.id}: ${err}`
@@ -942,5 +1318,223 @@ export class AdminApiServiceV2 {
           throw err;
         })
     );
+  }
+
+  /**
+   * Run the Admin API job to refresh the EdOrgs for the given environment. This is a long-running operation, so it returns a job ID that can be polled for completion.
+   * @param sbEnvironment - The environment whose Admin API client to use
+   * @returns Promise<string | null> - The job ID if successfully triggered, otherwise null
+   */
+  async triggerEdOrgRefresh(sbEnvironment: SbEnvironment): Promise<string | null> {
+    return triggerEdOrgRefresh(
+      this.getAdminApiClientForEnvironment(sbEnvironment),
+      'odsInstances/edOrgs/refresh',
+      this.logger,
+      sbEnvironment.name
+    );
+  }
+
+  /**
+   * Polls GET jobs/{jobId} until the job reaches a terminal state or the attempt limit is reached.
+   * Poll parameters are driven by ADMINAPI_REFRESH_POLL_ATTEMPTS and ADMINAPI_REFRESH_POLL_INTERVAL_MS config.
+   * @param sbEnvironment - The environment whose Admin API client to use
+   * @param jobId - The job ID returned by triggerEdOrgRefresh()
+   * @returns 'completed' | 'failed' | 'timeout'
+   */
+  async pollJobStatus(
+    sbEnvironment: SbEnvironment,
+    jobId: string
+  ): Promise<'completed' | 'failed' | 'timeout'> {
+    return pollJobStatus(
+      this.getAdminApiClientForEnvironment(sbEnvironment),
+      jobId,
+      this.logger,
+      sbEnvironment.name
+    );
+  }
+
+  /**
+   * Retrieve all tenants with their ODS instances and education organizations
+   * 
+   * This method:
+   * 1. Calls Admin API's anonymous tenancy endpoint (advertised at `urls.tenancy`) to discover tenant names
+   * 2. Determines tenant names based on the discovered tenant list
+   * 3. For each tenant, calls /v2/tenants/{tenantName}/OdsInstances/edOrgs to get detailed information
+   * 4. Maps the response to TenantDto format
+   *
+   * @param environment - SB Environment containing configuration
+   * @returns Promise resolving to array of tenant objects with EdOrgs and OdsInstances
+   */
+  async getTenants(environment: SbEnvironment): Promise<TenantDto[]> {
+    this.logger.log(`Getting tenants for environment: ${environment.name}`);
+
+    try {
+      // Step 1 & 2: Get the tenant list from Admin API's tenancy endpoint (anonymous,
+      // no login or bearer token needed) and determine tenant names. A failed lookup
+      // throws rather than falling back to 'default'.
+      const tenantNames = await resolveTenantNames(environment.adminApiUrl);
+
+      // Log credential availability for discovered tenants
+      const configPublic = environment.configPublic;
+      const v2Config =
+        'version' in configPublic && configPublic.version === 'v2' ? configPublic.values : undefined;
+      const availableTenants = Object.keys(v2Config?.tenants || {});
+      
+      this.logger.log(
+        `Discovered tenants from Admin API: [${tenantNames.join(', ')}]`
+      );
+      this.logger.log(
+        `Tenants with credentials in environment config: [${availableTenants.join(', ')}]`
+      );
+      
+      // Identify tenants without credentials
+      const tenantsWithoutCredentials = tenantNames.filter(
+        name => !availableTenants.includes(name)
+      );
+      if (tenantsWithoutCredentials.length > 0) {
+        this.logger.warn(
+          `WARNING: The following tenants were discovered but do NOT have credentials configured: ` +
+          `[${tenantsWithoutCredentials.join(', ')}]. ` +
+          `These tenants will be created with empty data. ` +
+          `Add credentials to your environment configuration to sync their data.`
+        );
+      }
+
+      // Step 3: Fetch details for each tenant
+      const tenantsWithDetails = await Promise.all(
+        tenantNames.map(async (tenantName) => {
+          try {
+            // Authenticate with tenant-specific credentials
+            this.logger.log(`Authenticating for tenant: ${tenantName}`);
+            const adminLogin = await this.login(environment, environment.id, tenantName);
+            if (adminLogin.status !== 'SUCCESS') {
+              const errorMsg = adminApiLoginStatusMsgs[adminLogin.status];
+              this.logger.warn(
+                `Failed to authenticate tenant "${tenantName}": ${adminLogin.status} - ${errorMsg}. ` +
+                `This tenant will be created with empty data. ` +
+                `Add credentials for "${tenantName}" to your environment configuration to sync its data.`
+              );
+              throw new CustomHttpException(
+                {
+                  title: `Failed to authenticate tenant ${tenantName}`,
+                  type: 'Error',
+                  message: `${adminLogin.status}: ${errorMsg}. Add credentials for this tenant to sync its data.`,
+                },
+                500
+              );
+            }
+
+            // Create a client with tenant header for multi-tenant API calls
+            const client = this.initializeApiClient(environment, true); // Get full response
+            
+            // Retrieve tenant-specific token using composite key
+            const tokenKey = this.getTenantTokenKey(environment.id, tenantName);
+            const token = this.adminApiTokens.get(tokenKey);
+            this.logger.log(`Using token key ${tokenKey} for tenant ${tenantName}`);
+            
+            // Call the tenant details endpoint with tenant header
+            const response = await client
+              .get<TenantOdsInstancesEdOrgsResponse>(`tenants/${tenantName}/odsInstances/edOrgs`, {
+                headers: {
+                  Authorization: `Bearer ${token}`,
+                  tenant: tenantName, // Add tenant header for multi-tenant API
+                },
+              })
+              .catch((err) => {
+                this.logger.error(
+                  `Error getting details for tenant ${tenantName}: ${err.message}`
+                );
+                throw err;
+              });
+
+            // Extract data from response
+            const details = response.data;
+
+            this.logger.log(
+              `Retrieved details for tenant ${tenantName} with ${details.odsInstances?.length || 0} ODS instances`
+            );
+
+            // Step 4: Map the response to TenantDto format
+            // Use tenantName (URL identifier) as the stable tenant id and name
+            const tenant: TenantDto = {
+              id: tenantName,
+              name: tenantName,
+              odsInstances: details.odsInstances?.map((instance: AdminApiOdsInstance) => {
+                const odsInstance: OdsInstanceDto = {
+                  id: instance.id ?? null,
+                  name: instance.name || 'Unknown ODS Instance',
+                  instanceManageId: instance.odsInstanceManageId ?? null,
+                  instanceType: instance.instanceType,
+                  status: instance.status ?? null,
+                  databaseTemplate: instance.databaseTemplate ?? null,
+                  databaseName: instance.databaseName ?? null,
+                  edOrgs: instance.educationOrganizations?.map((edOrg: AdminApiEducationOrganization) => {
+                    const educationOrg: EducationOrganizationDto = {
+                      instanceId: instance.id, // Use ODS instance ID
+                      instanceName: instance.name, // Use ODS instance name
+                      educationOrganizationId: edOrg.educationOrganizationId,
+                      nameOfInstitution: edOrg.nameOfInstitution,
+                      shortNameOfInstitution: edOrg.shortNameOfInstitution,
+                      discriminator: edOrg.discriminator,
+                      parentId: edOrg.parentId,
+                    };
+                    return educationOrg;
+                  }) || [],
+                };
+                return odsInstance;
+              }) || [],
+            };
+
+            return tenant;
+          } catch (detailsError) {
+            const errorMessage = detailsError instanceof Error 
+              ? detailsError.message 
+              : String(detailsError);
+            const errorStack = detailsError instanceof Error 
+              ? detailsError.stack 
+              : undefined;
+            
+            // Extract more specific error information
+            let specificReason = errorMessage;
+            if ('response' in detailsError && typeof detailsError.response === 'object') {
+              const response = detailsError.response as { message?: unknown };
+              if (response.message) {
+                specificReason = typeof response.message === 'string' 
+                  ? response.message 
+                  : JSON.stringify(response.message);
+              }
+            }
+            
+            this.logger.warn(
+              `Failed to get details for tenant "${tenantName}": ${specificReason}. ` +
+              `Returning tenant with empty ODS instances. ` +
+              `This tenant will appear in the database but will have no data until credentials are added.`,
+              errorStack
+            );
+            // Return tenant with empty details if the details endpoint fails
+            return {
+              id: tenantName,
+              name: tenantName,
+              odsInstances: [],
+            };
+          }
+        })
+      );
+
+      return tenantsWithDetails;
+    } catch (error) {
+      // Re-throw so administrators can identify and fix configuration problems.
+      // Tenant discovery failures (including "no tenancy endpoint"/404) are
+      // resolved by fetchAdminApiTenancy above, which returns { supported: false }
+      // rather than throwing — so any error reaching this point is a genuine
+      // failure and must never be papered over with a fabricated default tenant.
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      const errorStack = error instanceof Error ? error.stack : undefined;
+      this.logger.error(
+        `Failed to get tenants for environment ${environment.name}: ${errorMessage}`,
+        errorStack
+      );
+      throw error;
+    }
   }
 }

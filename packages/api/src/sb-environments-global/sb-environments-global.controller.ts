@@ -24,6 +24,7 @@ import {
   Delete,
   Get,
   Inject,
+  Logger,
   Param,
   ParseIntPipe,
   Post,
@@ -39,16 +40,20 @@ import {
 } from '../app/sb-environment-edfi-tenant.interceptor';
 import { Authorize } from '../auth/authorization';
 import { ReqUser } from '../auth/helpers/user.decorator';
-import { ENV_SYNC_CHNL, PgBossInstance } from '../sb-sync/sb-sync.module';
+import { ENV_SYNC_CHNL } from '../sb-sync/sb-sync.module';
+import { IJobQueueService } from '../sb-sync/job-queue/job-queue.interface';
 import {
+  AdminApiInfo,
+  checkTenantModeCompatibility,
   CustomHttpException,
   determineTenantModeFromMetadata,
-  determineVersionFromMetadata,
+  fetchAdminApiInfo,
   fetchOdsApiMetadata,
   throwNotFound,
   validateAdminApiUrl,
   ValidationHttpException,
 } from '../utils';
+import { fetchAdminApiTenancy, translateTenancyError, TenancyResult } from '../utils/admin-api-tenancy';
 import { SbEnvironmentsGlobalService } from './sb-environments-global.service';
 import { StartingBlocksServiceV2 } from '../teams/edfi-tenants/starting-blocks';
 import { Operation, SbVersion } from '../auth/authorization/sbVersion.decorator';
@@ -64,14 +69,14 @@ export class SbEnvironmentsGlobalController {
     @InjectRepository(SbEnvironment)
     private sbEnvironmentsRepository: Repository<SbEnvironment>,
     private startingBlocksServiceV2: StartingBlocksServiceV2,
-    @Inject('PgBossInstance')
-    private readonly boss: PgBossInstance,
+    @Inject('IJobQueueService')
+    private readonly jobQueue: IJobQueueService,
     @InjectRepository(SbSyncQueue) private readonly queueRepository: Repository<SbSyncQueue>
   ) {}
 
   /**
    * Creates a detailed response object for SbEnvironment with computed properties and tenant/ODS data
-   * Used by both findOne and update methods to maintain consistency
+   * Used by findOne method
    */
   private createDetailedEnvironmentResponse(environment: SbEnvironment) {
     const dto = toGetSbEnvironmentDto(environment);
@@ -144,7 +149,7 @@ export class SbEnvironmentsGlobalController {
           user
         )
       );
-      const id = await this.boss.send(
+      const id = await this.jobQueue.send(
         ENV_SYNC_CHNL,
         { sbEnvironmentId: sbEnvironment.id },
         { expireInHours: 2 }
@@ -194,21 +199,47 @@ export class SbEnvironmentsGlobalController {
     },
   })
   async checkEdFiVersionAndTenantMode(
-    @Body() body: { odsApiDiscoveryUrl: string }
+    @Body() body: { odsApiDiscoveryUrl: string; adminApiUrl?: string }
   ) {
-    const { odsApiDiscoveryUrl } = body;
+    const { odsApiDiscoveryUrl, adminApiUrl } = body;
     // Fetch ODS API metadata
     const odsApiMetaResponse = await fetchOdsApiMetadata({ odsApiDiscoveryUrl } as PostSbEnvironmentDto);
 
-    // Auto-detect version from metadata
-    const detectedVersion = determineVersionFromMetadata(odsApiMetaResponse);
+    // Fetch Admin API info if URL provided (to get the tenancy endpoint address)
+    let adminApiInfo: AdminApiInfo | undefined;
+    if (adminApiUrl) {
+      try {
+        adminApiInfo = await fetchAdminApiInfo(adminApiUrl);
+      } catch (adminApiError) {
+        // Log warning but don't fail - we can still determine mode from ODS API
+        Logger.warn('Failed to fetch Admin API info for tenant mode detection, falling back to ODS API:', adminApiError.message);
+      }
+    }
 
-    // Auto-detect tenant mode from metadata
-    const tenantMode = determineTenantModeFromMetadata(odsApiMetaResponse);
+    // Fetch the tenancy result once so both tenant-mode detection and the
+    // compatibility check below use the same Admin API signal. Unlike the
+    // info fetch above, a tenancy misconfiguration is a hard validation error
+    // rather than a soft fallback — it means the Admin API is reachable but
+    // misconfigured, not merely unreachable.
+    let tenancy: TenancyResult | undefined;
+    if (adminApiInfo) {
+      try {
+        tenancy = await fetchAdminApiTenancy(adminApiInfo, adminApiUrl);
+      } catch (error) {
+        throw translateTenancyError(error);
+      }
+    }
+
+    // Auto-detect tenant mode from metadata - prioritizes Admin API field
+    const tenantMode = determineTenantModeFromMetadata(odsApiMetaResponse, tenancy);
     const isMultiTenant = tenantMode === 'MultiTenant';
 
+    // Validate tenant mode compatibility if Admin API exposes a tenancy endpoint
+    checkTenantModeCompatibility(odsApiMetaResponse, !!adminApiInfo, tenancy);
+
     return {
-      version: detectedVersion,
+      odsVersion: odsApiMetaResponse ? odsApiMetaResponse.version : '',
+      version: adminApiInfo ? adminApiInfo.specificationVersion : '',
       isMultiTenant: isMultiTenant
     };
   }
@@ -263,29 +294,13 @@ export class SbEnvironmentsGlobalController {
     @Body() updateSbEnvironmentDto: PutSbEnvironmentDto,
     @ReqUser() user: GetSessionDataDto
   ) {
-    // Check if this includes tenant updates or URL/configuration updates
-    const hasTenantUpdates = updateSbEnvironmentDto.tenants && updateSbEnvironmentDto.tenants.length > 0;
-    const hasUrlUpdates = updateSbEnvironmentDto.odsApiDiscoveryUrl || updateSbEnvironmentDto.adminApiUrl || updateSbEnvironmentDto.environmentLabel || updateSbEnvironmentDto.isMultitenant !== undefined;
-
-    if (hasTenantUpdates || hasUrlUpdates) {
-      // Use the enhanced update method for tenant/ODS updates
-      const updatedEnvironment = await this.sbEnvironmentEdFiService.updateEnvironment(
-        sbEnvironmentId,
-        updateSbEnvironmentDto,
-        user
-      );
-
-      // Return the same detailed response as the findOne method for consistency
-      return this.createDetailedEnvironmentResponse(updatedEnvironment);
-    } else {
-      // Use the simple update method for name-only updates
-      return toGetSbEnvironmentDto(
-        await this.sbEnvironmentService.update(
-          sbEnvironmentId,
-          addUserModifying(updateSbEnvironmentDto, user)
-        )
-      );
-    }
+    const { environment, syncQueue } = await this.sbEnvironmentEdFiService.updateEnvironment(
+      sbEnvironmentId,
+      updateSbEnvironmentDto,
+      user
+    );
+    const detailed = this.createDetailedEnvironmentResponse(environment);
+    return syncQueue ? { ...detailed, syncQueue } : detailed;
   }
 
   @Delete(':sbEnvironmentId')
@@ -362,7 +377,7 @@ export class SbEnvironmentsGlobalController {
     },
   })
   async refreshResources(@Param('sbEnvironmentId', new ParseIntPipe()) sbEnvironmentId: number) {
-    const id = await this.boss.send(
+    const id = await this.jobQueue.send(
       ENV_SYNC_CHNL,
       { sbEnvironmentId: sbEnvironmentId },
       { expireInHours: 2 }

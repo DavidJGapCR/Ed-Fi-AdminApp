@@ -1,5 +1,6 @@
 import {
   CopyClaimsetDtoV2,
+  GetApiClientDtoV2,
   GetApplicationDtoV2,
   GetClaimsetSingleDtoV2,
   GetIntegrationAppDto,
@@ -7,8 +8,11 @@ import {
   Ids,
   ImportClaimsetSingleDtoV2,
   PostApplicationDtoV2,
+  PostApiClientDtoV2,
   PostApplicationFormDtoV2,
+  PutApiClientDtoV2,
   PostClaimsetDtoV2,
+  PostInstanceDtoV2,
   PostProfileDtoV2,
   PostVendorDtoV2,
   PutApplicationDtoV2,
@@ -18,8 +22,9 @@ import {
   PutVendorDtoV2,
   SecretSharingMethod,
   edorgKeyV2,
+  toApiClientYopassResponseDto,
   toApplicationYopassResponseDto,
-  toPostApplicationResponseDto,
+  toPostApiClientResponseDtoV2,
   toPostApplicationResponseDtoV2,
 } from '@edanalytics/models';
 import { EdfiTenant, Edorg, Ods, SbEnvironment } from '@edanalytics/models-server';
@@ -28,8 +33,10 @@ import {
   Body,
   CallHandler,
   Controller,
+  Inject,
   Delete,
   ExecutionContext,
+  ForbiddenException,
   Get,
   HttpException,
   Injectable,
@@ -64,12 +71,15 @@ import { checkId } from '../../../../auth/helpers/where-ids';
 import {
   CustomHttpException,
   ValidationHttpException,
+  asBool,
   isIAdminApiValidationError,
   postYopassSecret,
 } from '../../../../utils';
 import { AdminApiV1xExceptionFilter } from '../v1/admin-api-v1x-exception.filter';
 import { AdminApiServiceV2 } from './admin-api.v2.service';
 import { IntegrationAppsTeamService } from '../../../../integration-apps-team/integration-apps-team.service';
+import { ENV_SYNC_CHNL } from '../../../../sb-sync/sb-sync.module';
+import { IJobQueueService } from '../../../../sb-sync/job-queue/job-queue.interface';
 import config from 'config';
 
 @Injectable()
@@ -96,8 +106,9 @@ export class AdminApiControllerV2 {
     private readonly integrationAppsTeamService: IntegrationAppsTeamService,
     private readonly sbService: AdminApiServiceV2,
     @InjectRepository(Edorg) private readonly edorgRepository: Repository<Edorg>,
-    @InjectRepository(Ods) private readonly odsRepository: Repository<Ods>
-  ) { }
+    @InjectRepository(Ods) private readonly odsRepository: Repository<Ods>,
+    @Inject('IJobQueueService') private readonly jobQueue: IJobQueueService
+  ) {}
 
   /** Check application edorg IDs against auth cache for _safe_ operations (GET). Requires `some` ID to be authorized. */
   private checkApplicationEdorgsForSafeOperations(
@@ -305,7 +316,7 @@ export class AdminApiControllerV2 {
           ...application,
           id: application.id,
         };
-      } catch (error) {
+      } catch (_error) {
         return application;
       }
     } else {
@@ -333,8 +344,8 @@ export class AdminApiControllerV2 {
   ) {
     let claimset: GetClaimsetSingleDtoV2;
     try {
-      claimset = await this.sbService.getClaimset(edfiTenant, application.claimsetId);
-    } catch (claimsetNotFound) {
+      claimset = await this.sbService.getClaimsetBasic(edfiTenant, application.claimsetId);
+    } catch (_claimsetNotFound) {
       throw new ValidationHttpException({
         field: 'claimsetId',
         message: 'Cannot retrieve claimset for validation',
@@ -479,7 +490,7 @@ export class AdminApiControllerV2 {
   ) {
     let claimset: GetClaimsetSingleDtoV2;
     try {
-      claimset = await this.sbService.getClaimset(edfiTenant, application.claimsetId);
+      claimset = await this.sbService.getClaimsetBasic(edfiTenant, application.claimsetId);
     } catch (claimsetNotFound) {
       Logger.error(claimsetNotFound);
       throw new BadRequestException('Error trying to use claimset');
@@ -534,7 +545,7 @@ export class AdminApiControllerV2 {
           sbEnvironmentId: sbEnvironment.id,
         });
       }
-      if (config.USE_YOPASS) {
+      if (asBool(config.USE_YOPASS)) {
         try {
           const yopassResult = await postYopassSecret({
             ...adminApiResponse,
@@ -596,7 +607,147 @@ export class AdminApiControllerV2 {
     }
   }
 
-  @Put('applications/:applicationId/reset-credential')
+  //
+  // Api Clients
+  //
+
+  @Get('apiClients')
+  @Authorize({
+    privilege: 'team.sb-environment.edfi-tenant.ods.edorg.application:read',
+    subject: {
+      id: '__filtered__',
+      edfiTenantId: 'edfiTenantId',
+      teamId: 'teamId',
+    },
+  })
+  async getApiClients(
+    @Param('edfiTenantId', new ParseIntPipe()) edfiTenantId: number,
+    @Param('teamId', new ParseIntPipe()) teamId: number,
+    @ReqEdfiTenant() edfiTenant: EdfiTenant,
+    @InjectFilter('team.sb-environment.edfi-tenant.ods.edorg.application:read') validIds: Ids,
+    @Query('applicationId') applicationId?: number,
+  ) {
+    if (applicationId === undefined) {
+      throw new BadRequestException('Query parameter "applicationId" is required.');
+    }
+
+    const allApiClients = await this.sbService.getApiClients(edfiTenant, applicationId);
+    return allApiClients.filter((v) => checkId(v.id, validIds));
+  }
+
+  @Get('apiClients/:apiclientId')
+  @Authorize({
+    privilege: 'team.sb-environment.edfi-tenant.ods.edorg.application:read',
+    subject: {
+      id: '__filtered__',
+      edfiTenantId: 'edfiTenantId',
+      teamId: 'teamId',
+    },
+  })
+  async getApiClient(
+    @Param('edfiTenantId', new ParseIntPipe()) edfiTenantId: number,
+    @Param('teamId', new ParseIntPipe()) teamId: number,
+    @ReqEdfiTenant() edfiTenant: EdfiTenant,
+    @Param('apiclientId', new ParseIntPipe()) apiClientId: number,
+    @InjectFilter('team.sb-environment.edfi-tenant.ods.edorg.application:read')
+    validIds: Ids
+  ) {
+    if (!checkId(apiClientId, validIds)) {
+      throw new NotFoundException();
+    }
+    return await this.sbService.getApiClient(edfiTenant, apiClientId);
+  }
+
+  @Put('apiClients/:apiclientId')
+  @Authorize({
+    privilege: 'team.sb-environment.edfi-tenant.ods.edorg.application:update',
+    subject: {
+      id: '__filtered__',
+      edfiTenantId: 'edfiTenantId',
+      teamId: 'teamId',
+    },
+  })
+  async putApiClient(
+    @Param('edfiTenantId', new ParseIntPipe()) edfiTenantId: number,
+    @Param('teamId', new ParseIntPipe()) teamId: number,
+    @ReqEdfiTenant() edfiTenant: EdfiTenant,
+    @Param('apiclientId', new ParseIntPipe()) apiClientId: number,
+    @Body() apiClient: PutApiClientDtoV2,
+    @InjectFilter('team.sb-environment.edfi-tenant.ods.edorg.application:update')
+    validIds: Ids
+  ) {
+    if (!checkId(apiClientId, validIds)) {
+      throw new NotFoundException();
+    }
+
+    const existingApiClient = await this.sbService.getApiClient(edfiTenant, apiClientId);
+    if (
+      existingApiClient &&
+      existingApiClient.applicationId !== apiClient.applicationId
+    ) {
+      throw new BadRequestException(
+        'The applicationId in the request body must match the existing API client applicationId.'
+      );
+    }
+
+    return await this.sbService.putApiClient(edfiTenant, apiClientId, apiClient);
+  }
+
+  @Post('apiClients')
+  @Authorize({
+    privilege: 'team.sb-environment.edfi-tenant.ods.edorg.application:update',
+    subject: {
+      id: '__filtered__',
+      edfiTenantId: 'edfiTenantId',
+      teamId: 'teamId',
+    },
+  })
+  async postApiClient(
+    @Param('edfiTenantId', new ParseIntPipe()) edfiTenantId: number,
+    @Param('teamId', new ParseIntPipe()) teamId: number,
+    @ReqEdfiTenant() edfiTenant: EdfiTenant,
+    @ReqSbEnvironment() sbEnvironment: SbEnvironment,
+    @Body() apiClient: PostApiClientDtoV2,
+    @InjectFilter('team.sb-environment.edfi-tenant.ods.edorg.application:update')
+    validIds: Ids
+  ) {
+    const application = await this.sbService.getApplication(edfiTenant, apiClient.applicationId);
+    if (!this.checkApplicationEdorgsForUnsafeOperations(application, validIds)) {
+      throw new HttpException('You do not have control of all implicated Ed-Orgs', 403);
+    }
+
+    const adminApiResponse = await this.sbService.postApiClient(edfiTenant, apiClient);
+
+    if (asBool(config.USE_YOPASS)) {
+      try {
+        const yopassResult = await postYopassSecret({
+          ...adminApiResponse,
+          url: GetApiClientDtoV2.apiUrl(
+            sbEnvironment.startingBlocks,
+            sbEnvironment.domain,
+            apiClient.name,
+            edfiTenant.name
+          ),
+        });
+
+        return toApiClientYopassResponseDto({
+          link: yopassResult.link,
+          apiClientId: adminApiResponse.id,
+          secretSharingMethod: SecretSharingMethod.Yopass,
+        });
+      } catch (error) {
+        Logger.error('Yopass failed for postApiClient:', error);
+        throw error;
+      }
+    } else {
+      return toPostApiClientResponseDtoV2({
+        ...adminApiResponse,
+        secretSharingMethod: SecretSharingMethod.Direct,
+      });
+    }
+  }
+
+  @Put('apiClients/:apiclientId/reset-credential')
   @Authorize({
     privilege: 'team.sb-environment.edfi-tenant.ods.edorg.application:reset-credentials',
     subject: {
@@ -605,67 +756,111 @@ export class AdminApiControllerV2 {
       teamId: 'teamId',
     },
   })
-  async resetApplicationCredentials(
+  async resetApiClientCredentials(
     @Param('edfiTenantId', new ParseIntPipe()) edfiTenantId: number,
     @Param('teamId', new ParseIntPipe()) teamId: number,
     @ReqEdfiTenant() edfiTenant: EdfiTenant,
     @ReqSbEnvironment() sbEnvironment: SbEnvironment,
-    @Param('applicationId', new ParseIntPipe()) applicationId: number,
+    @Param('apiclientId', new ParseIntPipe()) apiClientId: number,
     @InjectFilter('team.sb-environment.edfi-tenant.ods.edorg.application:reset-credentials')
     validIds: Ids
   ) {
-    const application = await this.sbService.getApplication(edfiTenant, applicationId);
+    const apiClient = await this.sbService.getApiClient(edfiTenant, apiClientId);
+    const application = await this.sbService.getApplication(edfiTenant, apiClient.applicationId);
 
-    if (this.checkApplicationEdorgsForUnsafeOperations(application, validIds)) {
-      const integrationProviderApp = await this.integrationAppsTeamService.findOne({
-        applicationId,
-        edfiTenantId,
-      });
-      if (integrationProviderApp) {
-        throw new CustomHttpException(
-          {
-            title: 'Cannot reset credentials for an Integration Provider application.',
-            type: 'Error',
-          },
-          400
-        );
-      }
-
-      const adminApiResponse = await this.sbService.putApplicationResetCredential(
-        edfiTenant,
-        applicationId
-      );
-
-      if (config.USE_YOPASS) {
-        try {
-          const yopassResult = await postYopassSecret({
-            ...adminApiResponse,
-            url: GetApplicationDtoV2.apiUrl(
-              sbEnvironment.startingBlocks,
-              sbEnvironment.domain,
-              application.applicationName,
-              edfiTenant.name
-            ),
-          });
-
-          return toApplicationYopassResponseDto({
-            link: yopassResult.link,
-            applicationId: adminApiResponse.id,
-            secretSharingMethod: SecretSharingMethod.Yopass,
-          });
-        } catch (error) {
-          Logger.error('Yopass failed for resetApplicationCredentials:', error);
-          throw error; // Re-throw the original error
-        }
-      } else {
-        return toPostApplicationResponseDtoV2({
-          ...adminApiResponse,
-          secretSharingMethod: SecretSharingMethod.Direct,
-        });
-      }
-    } else {
+    if (!this.checkApplicationEdorgsForUnsafeOperations(application, validIds)) {
       throw new HttpException('You do not have control of all implicated Ed-Orgs', 403);
     }
+
+    const adminApiResponse = await this.sbService.putApiClientResetCredential(
+      edfiTenant,
+      apiClientId
+    );
+
+    if (asBool(config.USE_YOPASS)) {
+      try {
+        const yopassResult = await postYopassSecret({
+          ...adminApiResponse,
+          url: GetApiClientDtoV2.apiUrl(
+            sbEnvironment.startingBlocks,
+            sbEnvironment.domain,
+            application.applicationName,
+            edfiTenant.name
+          ),
+        });
+
+        return toApiClientYopassResponseDto({
+          link: yopassResult.link,
+          apiClientId: adminApiResponse.id,
+          secretSharingMethod: SecretSharingMethod.Yopass,
+        });
+      } catch (error) {
+        Logger.error('Yopass failed for resetApiClientCredentials:', error);
+        throw error;
+      }
+    } else {
+      return toPostApiClientResponseDtoV2({
+        ...adminApiResponse,
+        secretSharingMethod: SecretSharingMethod.Direct,
+      });
+    }
+  }
+
+  @Delete('apiClients/:apiclientId')
+  @Authorize({
+    privilege: 'team.sb-environment.edfi-tenant.ods.edorg.application:delete',
+    subject: {
+      id: '__filtered__',
+      edfiTenantId: 'edfiTenantId',
+      teamId: 'teamId',
+    },
+  })
+  async deleteApiClient(
+    @Param('edfiTenantId', new ParseIntPipe()) edfiTenantId: number,
+    @Param('teamId', new ParseIntPipe()) teamId: number,
+    @ReqEdfiTenant() edfiTenant: EdfiTenant,
+    @Param('apiclientId', new ParseIntPipe()) apiClientId: number,
+    @InjectFilter('team.sb-environment.edfi-tenant.ods.edorg.application:delete')
+    validIds: Ids
+  ) {
+    const apiClient = await this.sbService.getApiClient(edfiTenant, apiClientId);
+    const application = await this.sbService.getApplication(edfiTenant, apiClient.applicationId);
+
+    if (!this.checkApplicationEdorgsForUnsafeOperations(application, validIds)) {
+      throw new HttpException('You do not have control of all implicated Ed-Orgs', 403);
+    }
+
+    // NOTE: this guard is duplicated verbatim in admin-api.v3.controller.ts.
+    // Keep the two in sync until the broader v2/v3 controller duplication is
+    // tackled as a whole (see the edorg 403 check above for the same pattern).
+    // An Application with no credentials disappears from the UI entirely
+    // (AC-616), so the last one may not be deleted. The frontend disables the
+    // action, but that is only a hint — this covers direct API calls and the
+    // stale-tab race where the client's count is out of date.
+    const applicationApiClients = await this.sbService.getApiClients(
+      edfiTenant,
+      apiClient.applicationId
+    );
+    if (applicationApiClients.length <= 1) {
+      // Logged so a stale-tab retry can be told apart from the documented
+      // concurrent-delete race (two simultaneous deletes both reading a count
+      // of 2). The race leaves no 409 behind; a stale tab does.
+      Logger.warn(
+        `Refused to delete the last credential of Application ${apiClient.applicationId} ` +
+          `(apiClientId ${apiClientId}, credential count ${applicationApiClients.length})`
+      );
+      throw new CustomHttpException(
+        {
+          type: 'Error',
+          title: 'Cannot delete the only credential',
+          message:
+            'An Application needs at least one credential to work. Create another credential before deleting this one.',
+        },
+        409
+      );
+    }
+
+    return await this.sbService.deleteApiClient(edfiTenant, apiClientId);
   }
 
   //
@@ -704,11 +899,23 @@ export class AdminApiControllerV2 {
     @Param('edfiTenantId', new ParseIntPipe()) edfiTenantId: number,
     @Param('teamId', new ParseIntPipe()) teamId: number,
     @ReqEdfiTenant() edfiTenant: EdfiTenant,
-    @Query('id') _ids: string[] | string
+    @Query('id') _ids: string[] | string,
+    @InjectFilter('team.sb-environment.edfi-tenant.claimset:read') validIds: Ids
   ) {
+    if (_ids === undefined) throw new BadRequestException('At least one claimset ID must be provided');
     const ids = Array.isArray(_ids) ? _ids : [_ids];
+    const parsedIds = ids.map((id) => {
+      const trimmed = id.trim();
+      const n = parseInt(trimmed, 10);
+      if (isNaN(n) || n <= 0 || n.toString() !== trimmed)
+        throw new BadRequestException(`Invalid claimset ID: ${id}`);
+      return n;
+    });
+    for (const id of parsedIds) {
+      if (!checkId(id, validIds)) throw new ForbiddenException(`Access denied to claimset ID: ${id}`);
+    }
     const claimsets = await Promise.all(
-      ids.map((id) => this.sbService.exportClaimset(edfiTenant, Number(id)))
+      parsedIds.map((id) => this.sbService.exportClaimset(edfiTenant, id))
     );
     const title =
       claimsets.length === 1 ? claimsets[0].name : `${edfiTenant.sbEnvironment.envLabel} claimsets`;
@@ -829,7 +1036,15 @@ export class AdminApiControllerV2 {
     try {
       return await this.sbService.copyClaimset(edfiTenant, claimset);
     } catch (PostError: unknown) {
-      Logger.error(PostError);
+      Logger.error(
+         'Admin API copyClaimset failed: ' +
+           (axios.isAxiosError(PostError)
+             ? PostError.message +
+               ' (status ' +
+               (PostError.response?.status ?? 'unknown') +
+               ')'
+             : String(PostError))
+       );
       if (axios.isAxiosError(PostError)) {
         if (isIAdminApiValidationError(PostError.response?.data)) {
           if (PostError.response.data.errors?.Name?.[0]?.includes('this name already exists')) {
@@ -985,6 +1200,131 @@ export class AdminApiControllerV2 {
     }
   }
 
+  @Post('instances')
+  @Authorize({
+    privilege: 'team.sb-environment.edfi-tenant:create-ods',
+    subject: {
+      id: '__filtered__',
+      edfiTenantId: 'edfiTenantId',
+      teamId: 'teamId',
+    },
+  })
+  async postInstance(
+    @Param('edfiTenantId', new ParseIntPipe()) edfiTenantId: number,
+    @Param('teamId', new ParseIntPipe()) teamId: number,
+    @ReqEdfiTenant() edfiTenant: EdfiTenant,
+    @Body() instance: PostInstanceDtoV2
+  ) {
+    try {
+      const createdInstance = await this.sbService.postInstance(edfiTenant, instance);
+      const createdOds = await this.odsRepository.save({
+        edfiTenantId: edfiTenant.id,
+        sbEnvironmentId: edfiTenant.sbEnvironmentId,
+        odsInstanceId: createdInstance.id,
+        dbName: instance.name,
+        odsInstanceName: instance.name,
+        instanceType: instance.databaseTemplate,
+        databaseTemplate: instance.databaseTemplate,
+        status: 'PendingCreate',
+      });
+
+      await this.jobQueue.send(
+        ENV_SYNC_CHNL,
+        { sbEnvironmentId: edfiTenant.sbEnvironmentId },
+        { expireInHours: 2 }
+      );
+
+      return { id: createdOds.id };
+    } catch (PostError: unknown) {
+      Logger.error(
+        'Admin API postInstance failed: ' +
+          (axios.isAxiosError(PostError)
+            ? PostError.message +
+              ' (status ' +
+              (PostError.response?.status ?? 'unknown') +
+              ')'
+            : String(PostError))
+      );
+      if (
+        axios.isAxiosError(PostError) &&
+        isIAdminApiValidationError(PostError.response?.data) &&
+        Object.keys(PostError.response.data.errors).length > 0
+      ) {
+        const [apiField, apiMessages] = Object.entries(PostError.response.data.errors)[0];
+        const apiMessage = apiMessages[0];
+        if (apiField.toLowerCase() === 'name') {
+          throw new ValidationHttpException({
+            field: 'name',
+            message: apiMessage,
+          });
+        }
+        if (apiField.toLowerCase() === 'databasetemplate') {
+          throw new ValidationHttpException({
+            field: 'databaseTemplate',
+            message: apiMessage,
+          });
+        }
+        throw new CustomHttpException(
+          {
+            title: 'Validation error',
+            type: 'Error',
+            data: PostError.response.data,
+          },
+          400
+        );
+      }
+      throw PostError;
+    }
+  }
+
+  @Delete('instances/:instanceManageId')
+  @Authorize({
+    privilege: 'team.sb-environment.edfi-tenant:delete-ods',
+    subject: {
+      id: 'instanceManageId',
+      edfiTenantId: 'edfiTenantId',
+      teamId: 'teamId',
+    },
+  })
+  async deleteInstance(
+    @Param('edfiTenantId', new ParseIntPipe()) edfiTenantId: number,
+    @Param('teamId', new ParseIntPipe()) teamId: number,
+    @ReqEdfiTenant() edfiTenant: EdfiTenant,
+    @Param('instanceManageId', new ParseIntPipe()) instanceManageId: number
+  ) {
+    if (instanceManageId <= 0) {
+      throw new BadRequestException('instanceManageId must be greater than zero');
+    }
+
+    const localOds = await this.odsRepository.findOneBy({
+      edfiTenantId: edfiTenant.id,
+      instanceManageId,
+    });
+
+    if (!localOds) {
+      throw new NotFoundException('ODS not found for instanceManageId');
+    }
+
+    if (localOds.status !== 'Created') {
+      throw new BadRequestException("ODS must be in 'Created' status to delete by instanceManageId");
+    }
+
+    await this.sbService.deleteInstance(edfiTenant, instanceManageId);
+
+    await this.odsRepository.save({
+      ...localOds,
+      status: 'PendingDelete',
+    });
+
+    await this.jobQueue.send(
+      ENV_SYNC_CHNL,
+      { sbEnvironmentId: edfiTenant.sbEnvironmentId },
+      { expireInHours: 2 }
+    );
+
+    return undefined;
+  }
+
   @Post('profiles')
   @Authorize({
     privilege: 'team.sb-environment.edfi-tenant.profile:create',
@@ -1002,13 +1342,44 @@ export class AdminApiControllerV2 {
   ) {
     try {
       return await this.sbService.postProfile(edfiTenant, profile);
-    } catch (error) {
-      if (error.response.data.title === 'Validation failed') {
-        const errorDefiniton = error.response.data.errors['Definition'][0];
-        throw new HttpException(`Invalid XML format for definition: ${errorDefiniton}`, 500);
-      } else {
-        throw new HttpException('Error creating profile', 500);
+    } catch (PostError: unknown) {
+      Logger.error(
+         'Admin API postProfile failed: ' +
+           (axios.isAxiosError(PostError)
+             ? PostError.message +
+               ' (status ' +
+               (PostError.response?.status ?? 'unknown') +
+               ')'
+             : String(PostError))
+       );
+      if (axios.isAxiosError(PostError)) {
+        if (isIAdminApiValidationError(PostError.response?.data)) {
+          if (PostError.response.data.errors?.Name?.[0]?.includes('this name already exists')) {
+            throw new ValidationHttpException({
+              field: 'name',
+              message: 'A profile with this name already exists. Please choose a different name.',
+            });
+          } else if (PostError.response.data.errors?.Definition?.[0]?.includes('List of possible elements expected:')) {
+            const errorDefinition = PostError.response.data.errors['Definition'][0];
+            throw new ValidationHttpException(
+              {
+                field: 'definition',
+                message: `Invalid XML format for definition: ${errorDefinition}`,
+              }
+            );
+          } else {
+            throw new CustomHttpException(
+              {
+                title: 'Validation error',
+                type: 'Error',
+                data: PostError.response.data,
+              },
+              400
+            );
+          }
+        }
       }
+      throw PostError;
     }
   }
 

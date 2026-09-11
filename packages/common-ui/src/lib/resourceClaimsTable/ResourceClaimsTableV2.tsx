@@ -1,82 +1,14 @@
-import { Badge, BadgeProps, Box, Flex, IconButton, StyleProps, Text } from '@chakra-ui/react';
+import { Flex } from '@chakra-ui/react';
 import { GetClaimsetSingleDtoV2, GetResourceClaimDtoV2 } from '@edanalytics/models';
 import { CellContext, ColumnDef } from '@tanstack/react-table';
 import uniq from 'lodash/uniq';
 import { useMemo } from 'react';
-import { SbaaTableAllInOne, useSbaaTableContext } from '../sbaaTable';
-import { Icons } from '../Icons';
-
-const AuthStrategyBadge = (props: {
-  authDefault: string | null;
-  authOverride: string | null;
-  hasAtAll: boolean;
-}) => {
-  const { authDefault, authOverride, hasAtAll } = props;
-  const badgeProps: Partial<StyleProps & BadgeProps> = hasAtAll
-    ? authOverride
-      ? { colorScheme: 'blue' }
-      : authDefault
-      ? { colorScheme: 'gray', color: 'gray.600', fontStyle: 'italic' }
-      : { colorScheme: 'orange' }
-    : { colorScheme: 'red' };
-  return (
-    <Badge textTransform="none" {...badgeProps}>
-      {hasAtAll ? authOverride ?? authDefault ?? 'Auth strategy unknown' : 'Denied'}
-    </Badge>
-  );
-};
+import { SbaaTableAllInOne } from '../sbaaTable';
+import { AuthStrategyBadge, NameCell, NameHeader } from './resourceClaimCells';
 
 type ResourceClaimRow = GetResourceClaimDtoV2 & {
   actionsMap: Record<string, { default?: string; override?: string; enabled?: boolean }>;
   subRows: ResourceClaimRow[];
-};
-const NameHeader = () => {
-  const table = useSbaaTableContext().table;
-  const canAnyExpand = table?.getCanSomeRowsExpand();
-  return (
-    <Text as="span" pl={canAnyExpand ? '20px' : undefined}>
-      Name
-    </Text>
-  );
-};
-const NameCell = (props: CellContext<ResourceClaimRow, unknown>) => {
-  const table = useSbaaTableContext().table;
-  const canAnyExpand = table?.getCanSomeRowsExpand();
-  const canThisRowExpand = props.row.getCanExpand();
-
-  return (
-    <Box
-      ml={`${props.row.depth * 1.5}rem`}
-      pl={canThisRowExpand || !canAnyExpand ? undefined : '20px'}
-    >
-      {canThisRowExpand && (
-        <IconButton
-          display="inline-block"
-          onClick={() => props.row.toggleExpanded()}
-          aria-label="open or close"
-          title="open or close"
-          variant="unstyled"
-          w="20px"
-          h="20px"
-          minH="20px"
-          minW="20px"
-          size="xs"
-          className={props.row.getIsExpanded() ? 'opened' : undefined}
-          css={{
-            '&.opened': {
-              transition: '0.5s',
-              transform: 'rotate(90deg)',
-            },
-            svg: {
-              margin: 'auto',
-            },
-          }}
-          icon={<Icons.CaretRightFill />}
-        />
-      )}
-      {props.row.original.name}
-    </Box>
-  );
 };
 const extractActions = (rc: GetResourceClaimDtoV2): string[] => {
   return [
@@ -116,12 +48,20 @@ const mapRows = (rc: GetResourceClaimDtoV2) => {
   return output;
 };
 const actionSortOrder = ['Read', 'Create', 'Update', 'Delete', 'ReadChanges'];
+// indexOf returns -1 for an action not in actionSortOrder, which would sort it
+// before every known action (-1 < 0). Rank unrecognized actions after all known
+// ones instead, with an alphabetical tie-breaker for deterministic ordering.
+const actionSortRank = (action: string) => {
+  const index = actionSortOrder.indexOf(action);
+  return index === -1 ? actionSortOrder.length : index;
+};
 
 export const ResourceClaimsTableV2 = ({ claimset }: { claimset: GetClaimsetSingleDtoV2 }) => {
   const { data, columns } = useMemo(() => {
     // TODO this dynamic-ness is to accommodate buggy Admin API (want to include even unexpected actions). It probably ought to be hardcoded. Revisit eventually.
     const uniqueActions = uniq(claimset.resourceClaims.flatMap(extractActions)).sort(
-      (actionA, actionB) => actionSortOrder.indexOf(actionA) - actionSortOrder.indexOf(actionB)
+      (actionA, actionB) =>
+        actionSortRank(actionA) - actionSortRank(actionB) || actionA.localeCompare(actionB)
     );
     const columns: ColumnDef<ResourceClaimRow>[] = [
       {

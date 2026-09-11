@@ -1,6 +1,5 @@
 import {
   AddEdorgDtoV2,
-  ApplicationYopassResponseDto,
   EnvNavDto,
   GetApplicationDto,
   GetClaimsetDto,
@@ -48,8 +47,7 @@ import {
   SbSyncQueueDto,
   SpecificIds,
   ApplicationResponseV1,
-  PostApplicationResponseDto,
-  PutOdsDto
+  PutOdsDto,
 } from '@edanalytics/models';
 import { QueryKey, UseQueryOptions, useQueries } from '@tanstack/react-query';
 import kebabCase from 'kebab-case';
@@ -57,6 +55,7 @@ import path from 'path-browserify';
 import { authCacheKey } from '../../helpers';
 import { apiClient } from '../methods';
 import { EntityQueryBuilder, queryKeyNew, standardPath } from './builder';
+import { TeamOptions } from './team-options';
 
 const baseUrl = '';
 
@@ -128,12 +127,6 @@ export const queryKey = (params: {
 
 export const teamUrl = (url: string, teamId?: number | string | undefined) =>
   teamId === undefined ? path.join(baseUrl, url) : path.join(baseUrl, 'teams', String(teamId), url);
-
-export enum TeamOptions {
-  Never,
-  Optional,
-  Required,
-}
 
 export type EdfiTenantParamsType<IncludeEdfiTenant extends boolean> = IncludeEdfiTenant extends true
   ? { edfiTenantId: number | string }
@@ -285,6 +278,9 @@ export const sbEnvironmentQueriesGlobal = new EntityQueryBuilder({
           ...params.standardQueryKeyParams,
           pathOverride: undefined,
         }),
+        // Invalidate all tenant-scoped queries (ODS, EdOrgs, etc.) since any
+        // tenant in this environment may have been updated by the sync.
+        ['edfi-tenants'],
       ],
     },
     (base) => `${baseUrl}/sb-environments/${base.entity.id}/refresh-resources`
@@ -349,7 +345,25 @@ export const edfiTenantQueriesGlobal = new EntityQueryBuilder({
   )
   .put(
     'refreshResources',
-    { ReqDto: Id, ResDto: SbSyncQueueDto, keysToInvalidate: (params) => [['sb-sync-queues']] },
+    {
+      ReqDto: Id,
+      ResDto: SbSyncQueueDto,
+      keysToInvalidate: (params) => [
+        ['sb-sync-queues'],
+        // Invalidate ODS and EdOrg caches for this specific tenant so the UI
+        // reflects the completed sync immediately without needing a page reload.
+        queryKeyNew({
+          kebabCaseName: 'ods',
+          edfiTenant: params.entity as unknown as GetEdfiTenantDto,
+          id: false,
+        }),
+        queryKeyNew({
+          kebabCaseName: 'edorg',
+          edfiTenant: params.entity as unknown as GetEdfiTenantDto,
+          id: false,
+        }),
+      ],
+    },
     (base) =>
       `${baseUrl}/sb-environments/${base.sbEnvironmentId}/edfi-tenants/${base.entity.id}/refresh-resources`
   )
