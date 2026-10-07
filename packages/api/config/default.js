@@ -96,7 +96,17 @@ module.exports = {
           MSSQL_DB_PORT,
           MSSQL_DB_DATABASE,
         } = this.DB_SECRET_VALUE;
-        const connString = `mssql://${MSSQL_DB_USERNAME}:${MSSQL_DB_PASSWORD}@${MSSQL_DB_HOST}:${MSSQL_DB_PORT}/${MSSQL_DB_DATABASE}?encrypt=${this.DB_SSL}&trustServerCertificate=${this.DB_TRUST_CERTIFICATE}`;
+        // Percent-encode anything that carries user-chosen characters. SQL Server's password
+        // complexity rules push operators towards '@', '#', '!' and friends, and interpolating
+        // those raw produces a URL that parses wrongly: '@' splits the authority in the wrong
+        // place and '#' truncates at the fragment. Consumers decode -- TypeORM's
+        // DriverUtils already calls decodeURIComponent on the credentials, so without encoding
+        // here it decodes a value that was never encoded and throws outright on a '%'.
+        const connString = `mssql://${encodeURIComponent(MSSQL_DB_USERNAME)}:${encodeURIComponent(
+          MSSQL_DB_PASSWORD
+        )}@${MSSQL_DB_HOST}:${MSSQL_DB_PORT}/${encodeURIComponent(
+          MSSQL_DB_DATABASE
+        )}?encrypt=${this.DB_SSL}&trustServerCertificate=${this.DB_TRUST_CERTIFICATE}`;
 
         return connString;
       }
@@ -146,6 +156,33 @@ module.exports = {
     }
     return out;
   }),
+  SESSION_SECRET: defer(function () {
+    let out;
+    if (this.AWS_SESSION_SECRET) {
+      const secretsClient = new SecretsManagerClient({
+        region: this.AWS_REGION,
+      });
+      out = secretsClient
+        .send(
+          new GetSecretValueCommand({
+            SecretId: this.AWS_SESSION_SECRET,
+          })
+        )
+        .then((secretValueRaw) => {
+          if (secretValueRaw.SecretString === undefined) {
+            throw new Error('No client config values defined for the session secret when requesting secrets');
+          }
+
+          const secret = JSON.parse(secretValueRaw.SecretString);
+          return Array.isArray(secret) ? secret : [secret];
+        });
+    } else {
+      // locally we expect plain (non-promise) values.
+      const value = this.SESSION_SECRET_VALUE;
+      out = Array.isArray(value) ? value : [value];
+    }
+    return out;
+  }),
   USE_YOPASS: false,
   WHITELISTED_REDIRECTS: [this.FE_URL],
   MY_URL: (string = ''),
@@ -172,7 +209,8 @@ module.exports = {
   LOG_LEVEL: 'log',
 
   // Certification artifact configuration
+  CERT_ENABLED: false, // Master switch for the certification runtime/catalog sync at API startup
   CERT_BRUNO_SRC_REF: 'v2.1.0', // Tag name or commit ref
-  CERT_BRUNO_SRC_CHECKSUM: '71840f51f464c60d7b90c7bbf08d9be039df291d51dd69085ffc4703b98f11e6', // SHA-256 checksum of the artifact zip file for integrity verification
+  CERT_BRUNO_SRC_CHECKSUM: '72eaf14f4f95dc8088b04db79f46d693fb3a34356056c792100d014a374835d5', // SHA-256 checksum of the artifact zip file for integrity verification
   CERT_BRUNO_ON_DOWNLOAD_ERROR: 'error', // 'error' | 'warning' // Whether to error out or just warn if there's a problem downloading or initializing the certification artifact. Note that if set to 'warning' and there's a problem with the certification artifact, any API routes depending on it will fail at runtime when they attempt to use the artifact.
 };

@@ -27,8 +27,8 @@ import {
   UserTeamMembership,
 } from '@edanalytics/models-server';
 
-import { PostgresConnectionOptions } from 'typeorm/driver/postgres/PostgresConnectionOptions';
-import { SqlServerConnectionOptions } from 'typeorm/driver/sqlserver/SqlServerConnectionOptions';
+import { PostgresDataSourceOptions } from 'typeorm/driver/postgres/PostgresDataSourceOptions';
+import { SqlServerDataSourceOptions } from 'typeorm/driver/sqlserver/SqlServerDataSourceOptions';
 import * as config from 'config';
 import { asBool } from '../utils';
 
@@ -68,6 +68,7 @@ import { CertificationSchema1778026000000 as PgsqlCertificationSchema17780260000
 import { AddOdsInstanceMetadataFields1751299288000 as PgsqlAddOdsInstanceMetadataFields1751299288000 } from './migrations/pgsql/1751299288000-AddOdsInstanceMetadataFields';
 import { AddCreateDeleteOdsPrivileges1785181605952 as PgsqlAddCreateDeleteOdsPrivileges1785181605952 } from './migrations/pgsql/1785181605952-AddCreateDeleteOdsPrivileges';
 import { RenameDbInstanceIdToInstanceManageId1785365966591 as PgsqlRenameDbInstanceIdToInstanceManageId1785365966591 } from './migrations/pgsql/1785365966591-RenameDbInstanceIdToInstanceManageId';
+import { AddMissingPrivilegesToGlobalAdmin1791158400000 as PgsqlAddMissingPrivilegesToGlobalAdmin1791158400000 } from './migrations/pgsql/1791158400000-AddMissingPrivilegesToGlobalAdmin';
 
 // MSSQL migrations
 import { Initial1688158300508 as MssqlInitial1688158300508 } from './migrations/mssql/1687190483471-initial';
@@ -106,6 +107,7 @@ import { CertificationSchema1778026000000 as MssqlCertificationSchema17780260000
 import { AddOdsInstanceMetadataFields1751299288000 as MssqlAddOdsInstanceMetadataFields1751299288000 } from './migrations/mssql/1751299288000-AddOdsInstanceMetadataFields';
 import { AddCreateDeleteOdsPrivileges1785181605952 as MssqlAddCreateDeleteOdsPrivileges1785181605952 } from './migrations/mssql/1785181605952-AddCreateDeleteOdsPrivileges';
 import { RenameDbInstanceIdToInstanceManageId1785365966591 as MssqlRenameDbInstanceIdToInstanceManageId1785365966591 } from './migrations/mssql/1785365966591-RenameDbInstanceIdToInstanceManageId';
+import { AddMissingPrivilegesToGlobalAdmin1791158400000 as MssqlAddMissingPrivilegesToGlobalAdmin1791158400000 } from './migrations/mssql/1791158400000-AddMissingPrivilegesToGlobalAdmin';
 
 // Get migrations based on database engine
 const getPostgreSQLMigrations = () => [
@@ -144,6 +146,7 @@ const getPostgreSQLMigrations = () => [
   PgsqlAddOdsInstanceMetadataFields1751299288000,
   PgsqlAddCreateDeleteOdsPrivileges1785181605952,
   PgsqlRenameDbInstanceIdToInstanceManageId1785365966591,
+  PgsqlAddMissingPrivilegesToGlobalAdmin1791158400000,
 ];
 
 const getMSSQLMigrations = () => [
@@ -183,9 +186,10 @@ const getMSSQLMigrations = () => [
   MssqlAddOdsInstanceMetadataFields1751299288000,
   MssqlAddCreateDeleteOdsPrivileges1785181605952,
   MssqlRenameDbInstanceIdToInstanceManageId1785365966591,
+  MssqlAddMissingPrivilegesToGlobalAdmin1791158400000,
 ];
 
-const getDatabaseConfig = (): PostgresConnectionOptions | SqlServerConnectionOptions => {
+const getDatabaseConfig = (): PostgresDataSourceOptions | SqlServerDataSourceOptions => {
   const baseEntities = [
     EdfiTenant,
     Edorg,
@@ -232,7 +236,7 @@ const getDatabaseConfig = (): PostgresConnectionOptions | SqlServerConnectionOpt
         encrypt: asBool(config.DB_SSL),
         trustServerCertificate: asBool(config.DB_TRUST_CERTIFICATE),
       },
-    } as SqlServerConnectionOptions;
+    } as SqlServerDataSourceOptions;
   }
 
   return {
@@ -240,7 +244,7 @@ const getDatabaseConfig = (): PostgresConnectionOptions | SqlServerConnectionOpt
     migrations: getPostgreSQLMigrations(),
     type: 'postgres',
     // Add Postgres-specific options here if needed
-  } as PostgresConnectionOptions;
+  } as PostgresDataSourceOptions;
 };
 
 export default getDatabaseConfig();

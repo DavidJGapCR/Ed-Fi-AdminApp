@@ -39,6 +39,8 @@ module.exports = {
     KEY: 'bbeadc2d4d15f5c9cfc2239b682cca392b233ee6979b6b9578d256aa01a7c565',
     IV: '<ignore - this should be refactored out. See comments elsewhere>',
   },
+  // Array of session-signing secrets, newest first. Can replace with `node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"`
+  SESSION_SECRET_VALUE: ['dev-only-session-secret-local'],
 
   // Optional (can delete): seed IdP configs for your local Keycloak. You'll need to use these values for the appropriate things in keycloak itself.
   SAMPLE_OIDC_CONFIG: {
@@ -79,8 +81,9 @@ module.exports = {
   ADMINAPI_REFRESH_POLL_ATTEMPTS: 10,
   ADMINAPI_REFRESH_POLL_INTERVAL_MS: 5000,
   // Certification artifact configuration
+  CERT_ENABLED: false,
   CERT_BRUNO_SRC_REF: 'v2.1.0', // Tag name or commit ref
-  CERT_BRUNO_SRC_CHECKSUM: '71840f51f464c60d7b90c7bbf08d9be039df291d51dd69085ffc4703b98f11e6',
+  CERT_BRUNO_SRC_CHECKSUM: '72eaf14f4f95dc8088b04db79f46d693fb3a34356056c792100d014a374835d5',
   CERT_BRUNO_ON_DOWNLOAD_ERROR: 'error', // 'error' | 'warning' // Whether to error out or just warn if there's a problem downloading or initializing the certification artifact. Note that if set to 'warning' and there's a problem with the certification artifact, any API routes depending on it will fail at runtime when they attempt to use the artifact.
 
   // There are other defaults you can override if you want to. See default.js.

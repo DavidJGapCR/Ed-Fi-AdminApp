@@ -40,6 +40,12 @@ module.exports = {
     KEY: 'bbeadc2d4d15f5c9cfc2239b682cca392b233ee6979b6b9578d256aa01a7c565',
     IV: '<ignore - this should be refactored out. See comments elsewhere>',
   },
+  // No SESSION_SECRET_VALUE default here on purpose: this template ships as the
+  // real production.js inside the Docker image (packages/api/Dockerfile), so a
+  // usable default here would mean every deployment that forgets to override it
+  // shares the same hardcoded session-signing key. Supply SESSION_SECRET_VALUE
+  // or AWS_SESSION_SECRET at deploy time; checkEnv.ts and assertValidSessionSecret
+  // both fail startup if neither is set.
 
   // Updated to use nginx proxy URL
   SAMPLE_OIDC_CONFIG: {
@@ -75,7 +81,8 @@ module.exports = {
   // that use self-signed or otherwise untrusted certificates.
   SSL_VERIFICATION: true,
   // Certification artifact configuration
+  CERT_ENABLED: false,
   CERT_BRUNO_SRC_REF: 'v2.1.0',
-  CERT_BRUNO_SRC_CHECKSUM: '71840f51f464c60d7b90c7bbf08d9be039df291d51dd69085ffc4703b98f11e6',
+  CERT_BRUNO_SRC_CHECKSUM: '72eaf14f4f95dc8088b04db79f46d693fb3a34356056c792100d014a374835d5',
   CERT_BRUNO_ON_DOWNLOAD_ERROR: 'warning',
 };

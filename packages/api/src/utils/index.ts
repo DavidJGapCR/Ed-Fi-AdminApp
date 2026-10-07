@@ -5,3 +5,5 @@ export * from './api-metadata-utils';
 export * from './applyDtoUpdates';
 export * from './edorg-tree-builder';
 export * from './config-bool';
+export * from './withoutId';
+export * from './resolveNextRoleId';

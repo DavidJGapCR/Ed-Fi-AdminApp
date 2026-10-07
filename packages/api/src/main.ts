@@ -4,8 +4,7 @@ process.env['NODE_CONFIG_DIR'] = process.env['NODE_CONFIG_DIR'] || './packages/a
 
 import './utils/checkEnv';
 
-import { formErrFromValidator } from '@edanalytics/utils';
-import { ClassSerializerInterceptor, Logger, LogLevel, ValidationPipe } from '@nestjs/common';
+import { ClassSerializerInterceptor, Logger, LogLevel } from '@nestjs/common';
 import { NestFactory, Reflector } from '@nestjs/core';
 import { DocumentBuilder, SwaggerModule } from '@nestjs/swagger';
 import colors from 'colors/safe';
@@ -20,34 +19,25 @@ import passport from 'passport';
 import { Client } from 'pg';
 import * as sql from 'mssql';
 import { AppModule } from './app/app.module';
+import {
+  createMssqlConfig,
+  describeMissingDatabase,
+  findMissingDatabase,
+} from './database/mssql-connection';
 import { ArtifactService } from './certification/artifact/artifact.service';
 import { CatalogService } from './certification/catalog/catalog.service';
-import { asBool } from './utils';
-import { CustomHttpException } from './utils/customExceptions';
 import { AggregateErrorHandler } from './app/aggregate-error-handler';
 import { AggregateErrorFilter } from './app/aggregate-error.filter';
+import { createCsrfOriginGuard } from './app/csrf-origin-guard';
+import { createGlobalValidationPipe } from './app/global-validation-pipe';
+import { getSessionCookieOptions, SESSION_TRUST_PROXY_HOPS } from './app/session-cookie-options';
+import { assertValidSessionSecret } from './app/session-secret';
+import { assertValidDbEncryptionSecret } from './app/db-encryption-secret';
 import axios from 'axios';
 import https from 'https';
 
 const FIVE_SECONDS_IN_MILLISECONDS = 5000;
 const DB_TTL_IN_SECONDS = 60 * config.DB_TTL_IN_MINUTES;
-
-async function createMssqlConfig(): Promise<sql.config> {
-  const mssqlConnectionStr = await config.DB_CONNECTION_STRING;
-  const urlParts = new URL(mssqlConnectionStr);
-  return {
-    server: urlParts.hostname,
-    port: parseInt(urlParts.port) || 1433,
-    database: urlParts.pathname.slice(1),
-    user: urlParts.username,
-    password: urlParts.password,
-    options: {
-      encrypt: asBool(config.DB_SSL),
-      trustServerCertificate: asBool(config.DB_TRUST_CERTIFICATE),
-    },
-    connectionTimeout: FIVE_SECONDS_IN_MILLISECONDS, // this might be to aggressive
-  };
-}
 
 async function createMssqlConnection(mssqlConfig?: sql.config): Promise<sql.ConnectionPool> {
   mssqlConfig = mssqlConfig || (await createMssqlConfig());
@@ -91,6 +81,18 @@ async function checkDatabaseAvailability(): Promise<void> {
     const errorAnalysis = AggregateErrorHandler.handle(error);
 
     Logger.error(errorAnalysis.safeMessage);
+
+    // SQL Server reachable + credentials valid, but the database is not available. The
+    // container creates MSSQL_DB only on first boot; a volume from an earlier run is left
+    // untouched. Report it precisely and stop -- creating or dropping anything here is the
+    // operator's call. The probe returns null unless it can actually prove the claim.
+    if (config.DB_ENGINE === 'mssql') {
+      const missingDatabase = await findMissingDatabase();
+      if (missingDatabase) {
+        Logger.error(describeMissingDatabase(missingDatabase).join('\n'));
+      }
+    }
+
     Logger.debug(`Detailed error: ${error}`);
 
     if (AggregateErrorHandler.isAggregateError(error)) {
@@ -189,12 +191,26 @@ function getLogLevel(): LogLevel[] {
 }
 
 async function bootstrap() {
+  // Apply the configured log levels before anything logs. NestFactory.create() normally does
+  // this via its `logger` option, but the database check below runs before that -- and until
+  // overrideLogger is called the static Logger uses Nest's own defaults, which include debug
+  // and verbose. Without this, startup debug output (including connection parameters) would
+  // print even for an operator who set LOG_LEVEL=log or error.
+  Logger.overrideLogger(getLogLevel());
+
+  // Check database availability first - exit if not available.
+  // This must run BEFORE NestFactory.create: creating the app initializes TypeOrmModule,
+  // which opens its own connection and throws from deep inside Nest's bootstrap when the
+  // database is unreachable. Running the check afterwards meant it could never report a
+  // connection problem -- the process had already died with a raw driver stack trace, and
+  // the diagnostics below (including the missing-database explanation) were unreachable.
+  await checkDatabaseAvailability();
+
   const app = await NestFactory.create<NestExpressApplication>(AppModule, {
     logger: getLogLevel(),
   });
 
-  // Check database availability first - exit if not available
-  await checkDatabaseAvailability();
+  app.set('trust proxy', SESSION_TRUST_PROXY_HOPS);
 
   // Optimize response headers for security
   app.disable('x-powered-by');
@@ -205,22 +221,27 @@ async function bootstrap() {
   });
 
   const globalPrefix = 'api';
-  await config.DB_ENCRYPTION_SECRET;
+  const dbEncryptionSecret = await config.DB_ENCRYPTION_SECRET;
+  assertValidDbEncryptionSecret(dbEncryptionSecret);
 
   const connectionStr = await config.DB_CONNECTION_STRING;
   const engine = config.DB_ENGINE || 'pgsql';
 
   const sessionStore = await setupDatabaseSession(connectionStr, engine);
 
+  const sessionSecret = await config.SESSION_SECRET;
+  assertValidSessionSecret(sessionSecret);
+
   app.use(json({ limit: '512kb' }));
+  app.use(createCsrfOriginGuard(config.FE_URL));
   app.use(
     expressSession.default({
       store: sessionStore,
-      // cryptographic signing is not necessary here. expressSession is very generic and there are other ways of using it for which signing is important.
-      secret: 'my-secret',
+      // array supports rotation: the first entry signs new cookies, the rest remain valid for verification.
+      secret: sessionSecret,
       resave: false,
       saveUninitialized: false,
-      cookie: { secure: 'auto' },
+      cookie: getSessionCookieOptions(),
     })
   );
   app.use(passport.initialize());
@@ -231,19 +252,7 @@ async function bootstrap() {
   // Add global exception filter for AggregateError handling
   app.useGlobalFilters(new AggregateErrorFilter());
 
-  app.useGlobalPipes(
-    new ValidationPipe({
-      transform: true,
-      stopAtFirstError: false,
-      exceptionFactory: (validationErrors = []) => {
-        return new CustomHttpException({
-          type: 'ValidationError',
-          title: 'Invalid submission.',
-          data: { errors: formErrFromValidator(validationErrors) },
-        });
-      },
-    })
-  );
+  app.useGlobalPipes(createGlobalValidationPipe());
   app.enableCors({ origin: config.FE_URL, credentials: true });
   app.useGlobalInterceptors(
     new ClassSerializerInterceptor(app.get(Reflector), {
@@ -297,21 +306,25 @@ async function bootstrap() {
   Logger.log(`🚀 Application is running on: http://localhost:${port}/${globalPrefix}`);
 
   // Initialize certification runtime workspace
-  try {
-    const artifactService = app.get(ArtifactService, { strict: false });
-    await artifactService.ensureRuntimeReady();
-    if (artifactService.isRunTimeReady) {
-      Logger.log('Certification runtime ensured');
+  if (config.CERT_ENABLED === false || config.CERT_ENABLED === 'false') {
+    Logger.log('Certification runtime disabled (CERT_ENABLED=false)');
+  } else {
+    try {
+      const artifactService = app.get(ArtifactService, { strict: false });
+      await artifactService.ensureRuntimeReady();
+      if (artifactService.isRunTimeReady) {
+        Logger.log('Certification runtime ensured');
 
-      const catalogService = app.get(CatalogService, { strict: false });
-      await catalogService.sync(artifactService.currentRef, artifactService.sisRoot);
-      Logger.log('Certification catalog sync complete');
-    } else {
-      Logger.warn('Certification runtime is not ready; skipping catalog sync');
+        const catalogService = app.get(CatalogService, { strict: false });
+        await catalogService.sync(artifactService.currentRef, artifactService.sisRoot);
+        Logger.log('Certification catalog sync complete');
+      } else {
+        Logger.warn('Certification runtime is not ready; skipping catalog sync');
+      }
+    } catch (err) {
+      const details = err instanceof Error ? err.stack ?? err.message : String(err);
+      Logger.error(`Certification runtime failed: ${details}`);
     }
-  } catch (err) {
-    const details = err instanceof Error ? err.stack ?? err.message : String(err);
-    Logger.error(`Certification runtime failed: ${details}`);
   }
 
   // Set up global error handlers for AggregateError and other unhandled errors

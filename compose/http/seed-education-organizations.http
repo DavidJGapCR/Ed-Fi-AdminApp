@@ -12,8 +12,8 @@
 
 # ── Variables ────────────────────────────────────────────────────────────────
 
-@adminapi_url     = https://localhost/odsv7-adminv2-multi-adminapi
-@odsapi_url       = https://localhost/odsv7-adminv2-multi-api
+@adminapi_url     = https://localhost/odsv7-adminv3-multi-adminapi
+@odsapi_url       = https://localhost/odsv7-adminv3-multi-api
 @tenant           = tenant1
 
 # Admin API OAuth client (registered in v7.http or Step 1 below)
@@ -48,7 +48,7 @@ grant_type=client_credentials&scope=edfi_admin_api/full_access
 
 ### 2. Create a Vendor
 # @name createVendor
-POST {{adminapi_url}}/v2/vendors
+POST {{adminapi_url}}/v3/vendors
 Content-Type: application/json
 Authorization: bearer {{adminToken}}
 Tenant: {{tenant}}
@@ -61,7 +61,7 @@ Tenant: {{tenant}}
 
 ###
 # Extract the numeric vendor id from the Location header, e.g. /v2/vendors/3 → 3
-@vendorId = {{createVendor.response.headers.Location}}
+@vendorId = 1
 
 
 # ── STEP 3 — Look up the ODS Instance id ─────────────────────────────────────
@@ -69,7 +69,7 @@ Tenant: {{tenant}}
 
 ### 3. List ODS instances for this tenant
 # @name listOdsInstances
-GET {{adminapi_url}}/v2/odsinstances
+GET {{adminapi_url}}/v3/datastores
 Authorization: bearer {{adminToken}}
 Tenant: {{tenant}}
 
@@ -79,26 +79,67 @@ Tenant: {{tenant}}
 @odsInstanceId = 1
 
 
+GET {{adminapi_url}}/v3/claimSets
+Content-Type: application/json
+Authorization: bearer {{adminToken}}
+Tenant: {{tenant}}
+
+### Make a copy of a claimset
+# @name copyClaimSet
+POST {{adminapi_url}}/v3/claimSets/copy
+Content-Type: application/json
+Authorization: bearer {{adminToken}}
+Tenant: {{tenant}}
+
+{
+  "originalId": 6,
+  "name": "BootstrapDescriptorsAndEdOrgs"
+}
+
+
 # ── STEP 4 — Create an Application with the bootstrap claim set ───────────────
 # "Bootstrap Descriptors and EdOrgs" grants write access to descriptors and
 # education organizations, which is exactly what we need for seeding.
 
 ### 4. Create an Application
 # @name createApplication
-POST {{adminapi_url}}/v2/applications
+POST {{adminapi_url}}/v3/applications
 Content-Type: application/json
 Authorization: bearer {{adminToken}}
 Tenant: {{tenant}}
 
 {
   "applicationName": "EdOrg Seeder",
-  "vendorId": {{odsInstanceId}},
-  "claimSetName": "Bootstrap Descriptors and EdOrgs",
+  "vendorId": {{vendorId}},
+  "claimSetName": "BootstrapDescriptorsAndEdOrgs",
   "educationOrganizationIds": [1],
-  "odsInstanceIds": [
+  "datastoreIds": [
     {{odsInstanceId}}
   ]
 }
+
+
+### 5. Update an Application
+# @name updateApplication
+PUT {{adminapi_url}}/v3/applications/1
+Content-Type: application/json
+Authorization: bearer {{adminToken}}
+Tenant: {{tenant}}
+
+{
+  "id": 1,
+  "applicationName": "EdOrg Seeder",
+  "vendorId": {{vendorId}},
+  "claimSetName": "BootstrapDescriptorsAndEdOrgs",
+  "educationOrganizationIds": [1]
+}
+
+
+### get applications
+# @name listApplications
+GET {{adminapi_url}}/v3/applications
+Authorization: bearer {{adminToken}}
+Tenant: {{tenant}}
 
 ###
 # NOTE: copy the numeric application id from the Location header response above.
@@ -110,7 +151,7 @@ Tenant: {{tenant}}
 
 ### 5. Create an API Client
 # @name createApiClient
-POST {{adminapi_url}}/v2/apiclients
+POST {{adminapi_url}}/v3/apiclients
 Content-Type: application/json
 Authorization: bearer {{adminToken}}
 Tenant: {{tenant}}
@@ -119,7 +160,7 @@ Tenant: {{tenant}}
   "name": "EdOrg Seeder Client",
   "isApproved": true,
   "applicationId": {{applicationId}},
-  "odsInstanceIds": [
+  "datastoreIds": [
     {{odsInstanceId}}
   ]
 }
@@ -221,7 +262,7 @@ Authorization: bearer {{odsToken}}
 
 ### 8a. Create a read Application (SIS Vendor claim set)
 # @name createReadApplication
-POST {{adminapi_url}}/v2/applications
+POST {{adminapi_url}}/v3/applications
 Content-Type: application/json
 Authorization: bearer {{adminToken}}
 Tenant: {{tenant}}
@@ -245,7 +286,7 @@ Tenant: {{tenant}}
 
 ### 8b. Create an API Client for the read Application
 # @name createReadApiClient
-POST {{adminapi_url}}/v2/apiclients
+POST {{adminapi_url}}/v3/apiclients
 Content-Type: application/json
 Authorization: bearer {{adminToken}}
 Tenant: {{tenant}}
@@ -293,19 +334,19 @@ Authorization: bearer {{readToken}}
 # ── STEP 10 — Queue Job in Admin API ───────────────────────────────────────────────────────────
 
 ### 10a. Queue the eduction organization sync job to propagate the new edorgs to the tenant's ODS instance
-POST {{adminapi_url}}/v2/odsInstances/edOrgs/refresh
+POST {{adminapi_url}}/v3/odsInstances/edOrgs/refresh
 Content-Type: application/json
 Authorization: bearer {{adminToken}}
 Tenant: {{tenant}}
 
 ### 10b. Verify the edorgs have been refreshed for the tenant's ODS instance
-GET {{adminapi_url}}/v2/odsInstances/edOrgs
+GET {{adminapi_url}}/v3/odsInstances/edOrgs
 Content-Type: application/json
 Authorization: bearer {{adminToken}}
 Tenant: {{tenant}}
 
 ### 10c. Verify the edorgs have been refreshed for the tenant's ODS instance
-GET {{adminapi_url}}/v2/odsInstances/1/edOrgs
+GET {{adminapi_url}}/v3/odsInstances/1/edOrgs
 Content-Type: application/json
 Authorization: bearer {{adminToken}}
 Tenant: {{tenant}}
